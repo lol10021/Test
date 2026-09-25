@@ -40,7 +40,13 @@
     maxDepth: Infinity,      // глубже не обходить
     maxElements: Infinity,   // сколько элементов обойти
     filename: null,          // имя файла; null — «сайт_дата_время_layout.html/png»
+    pngScale: 1,             // масштаб PNG: 1 — ровно размер страницы в пикселях; 'screen' — как у экрана (devicePixelRatio); 2 — вдвое чётче
   };
+
+  function resolveScale(v) {
+    if (v === 'screen') return global.devicePixelRatio || 1;
+    return +v > 0 ? +v : 1;
+  }
 
   const VIVID = ['#ef4444', '#f59e0b', '#22c55e', '#06b6d4', '#3b82f6', '#a855f7', '#ec4899', '#84cc16'];
   const MAX_D = 60; // глубже — один класс
@@ -577,10 +583,9 @@ ${data.items.join('\n')}
   }
 
   // Рисует собранный документ в PNG через SVG <foreignObject>: в нём только простые блоки и текст
-  async function renderPNG(doc, data) {
+  async function renderPNG(doc, data, pngScale = 1) {
     const w = data.width, h = data.height;
-    const dpr = global.devicePixelRatio || 1;
-    const scale = Math.max(0.1, Math.min(dpr, 32767 / w, 32767 / h, Math.sqrt(268435456 / (w * h))));
+    const scale = Math.max(0.1, Math.min(resolveScale(pngScale), 32767 / w, 32767 / h, Math.sqrt(268435456 / (w * h))));
     const wrap = doc.createElement('div');
     const st = doc.createElement('style');
     st.textContent = doc.getElementById('lb-base').textContent + '\n' + doc.getElementById('lb-theme').textContent +
@@ -649,7 +654,7 @@ ${data.items.join('\n')}
   async function toPNG(userOpts = {}) {
     const { view, rest } = split(userOpts);
     const data = await collect(rest);
-    return withDoc(buildDoc(data, view), (doc) => renderPNG(doc, data));
+    return withDoc(buildDoc(data, view), (doc) => renderPNG(doc, data, rest.pngScale != null ? rest.pngScale : DEFAULTS.pngScale));
   }
 
   async function download(userOpts = {}) {
@@ -717,6 +722,8 @@ input[type=color]{width:26px;height:18px;border:1px solid rgba(255,255,255,.15);
     </div>
     <div class="row"><div class="lab"><span>Область</span></div><div class="seg" id="scope"><button data-v="view">Экран</button><button data-v="page">Вся страница</button></div></div>
     <div class="row"><div class="lab"><span>Картинки</span></div><div class="seg" id="media"><button data-v="box">Рамкой</button><button data-v="real">Как есть</button></div></div>
+    <div class="row"><div class="lab"><span>Размер PNG</span><span class="v" id="vsz"></span></div>
+      <div class="seg" id="pscale"><button data-v="1">1×</button><button data-v="screen">Как экран</button><button data-v="2">2×</button></div></div>
     <div class="dl"><button class="btn" id="html">Скачать HTML</button><button class="btn" id="png">Скачать PNG</button></div>
     <div class="dl"><button class="btn sec" id="refresh" title="Снять заново (страница могла измениться)">Обновить</button><span class="st" id="st"></span></div>
   </div>
@@ -734,7 +741,7 @@ input[type=color]{width:26px;height:18px;border:1px solid rgba(255,255,255,.15);
   async function open(userOpts = {}) {
     if (panel) return panel.api;
     const { view, rest } = split(userOpts);
-    const opts = Object.assign({ fullPage: false, media: 'box' }, rest);
+    const opts = Object.assign({ fullPage: false, media: 'box', pngScale: DEFAULTS.pngScale }, rest);
 
     const frame = document.createElement('iframe');
     frame.setAttribute(IGNORE, '');
@@ -767,6 +774,9 @@ input[type=color]{width:26px;height:18px;border:1px solid rgba(255,255,255,.15);
       $('bgcolor').value = toHex(effectiveBg(data, view));
       root.querySelectorAll('#scope button').forEach((b) => b.classList.toggle('on', (b.dataset.v === 'page') === !!opts.fullPage));
       root.querySelectorAll('#media button').forEach((b) => b.classList.toggle('on', b.dataset.v === opts.media));
+      root.querySelectorAll('#pscale button').forEach((b) => b.classList.toggle('on', b.dataset.v === String(opts.pngScale)));
+      const k = resolveScale(opts.pngScale);
+      $('vsz').textContent = `${Math.round(data.width * k)}×${Math.round(data.height * k)}`;
     }
 
     function refreshView() {
@@ -803,6 +813,7 @@ input[type=color]{width:26px;height:18px;border:1px solid rgba(255,255,255,.15);
     $('theme').addEventListener('click', (e) => { const v = e.target.dataset && e.target.dataset.v; if (v) { view.theme = v; refreshView(); } });
     $('scope').addEventListener('click', (e) => { const v = e.target.dataset && e.target.dataset.v; if (v && (v === 'page') !== !!opts.fullPage) { opts.fullPage = v === 'page'; capture(); } });
     $('media').addEventListener('click', (e) => { const v = e.target.dataset && e.target.dataset.v; if (v && v !== opts.media) { opts.media = v; capture(); } });
+    $('pscale').addEventListener('click', (e) => { const v = e.target.dataset && e.target.dataset.v; if (v) { opts.pngScale = v === 'screen' ? 'screen' : +v; syncControls(); } });
     $('refresh').addEventListener('click', () => capture());
     $('html').addEventListener('click', () => {
       const html = '<!DOCTYPE html>\n' + doc().documentElement.outerHTML;
@@ -811,7 +822,7 @@ input[type=color]{width:26px;height:18px;border:1px solid rgba(255,255,255,.15);
     });
     $('png').addEventListener('click', async () => {
       $('png').disabled = true; status('Рисую PNG…');
-      try { saveBlob(await renderPNG(doc(), data), autoFilename('png')); status('PNG сохранён'); }
+      try { saveBlob(await renderPNG(doc(), data, opts.pngScale), autoFilename('png')); status('PNG сохранён'); }
       catch (err) { status('❌ ' + (err.message || err)); }
       finally { $('png').disabled = false; }
     });
