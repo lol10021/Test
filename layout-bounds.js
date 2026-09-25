@@ -1,51 +1,48 @@
 /*!
- * layout-bounds.js — «границы макета» страницы в HTML-файл (как «Показывать границы макета»
- * в Android или подсветка блоков в DevTools).
+ * layout-bounds.js — «границы макета» страницы (как «Показывать границы макета» в Android
+ * или подсветка блоков в DevTools), с панелью настроек и скачиванием в HTML или PNG.
  *
  * Каждый видимый элемент — рамка точно по его месту и размеру на экране, внутри — его текст
- * на тех же позициях, построчно. Ничего из вёрстки сайта не копируется: всё измеряется
- * у браузера (getBoundingClientRect, Range.getClientRects), поэтому расположение совпадает
- * с экраном даже на сложных страницах. Обрезка прокручиваемыми блоками учитывается.
- * Наведите мышь на рамку в файле — подсветится, во всплывающей подсказке тег, классы и размер.
+ * на тех же позициях, построчно, в том же порядке слоёв, что и на экране. Ничего из вёрстки
+ * сайта не копируется: всё измеряется у браузера (getBoundingClientRect, Range.getClientRects).
  *
- * Использование:
- *   1) Вставить в консоль — сразу скачает «сайт_дата_время_layout.html».
- *   2) <script src="layout-bounds.js" data-manual></script>, затем:
- *        await layoutBounds.download();                                  // видимая область
- *        await layoutBounds.download({ fullPage: true });                // вся страница
- *        await layoutBounds.download({ target: document.querySelector('#table') });
- *        const html = await layoutBounds.toHTML();
- *   Настройки до вставки в консоль: window.LAYOUT_BOUNDS_CONFIG = { fullPage: true, ... }
+ * Вставьте в консоль — поверх страницы откроется предпросмотр и панель:
+ *   глубина «от» и «до», цвет и яркость рамок, текст, заливка, отступы, поля, «поверх страницы»,
+ *   область (экран / вся страница), картинки (рамкой / как есть), «Скачать HTML», «Скачать PNG».
+ *   Панель перетаскивается за заголовок, Esc — закрыть. Наведите мышь на рамку — подсказка
+ *   с тегом, классами и размером.
+ *
+ * Без панели (<script src="layout-bounds.js" data-manual></script>):
+ *   await layoutBounds.download({ fullPage: true, theme: 'mono', color: '#22c55e' });  // HTML
+ *   await layoutBounds.downloadPNG({ depthTo: 6 });                                      // PNG
+ *   const html = await layoutBounds.toHTML({ target: document.querySelector('#table') });
+ *   layoutBounds.open() / layoutBounds.close()                                           // панель
+ * Настройки до вставки в консоль: window.LAYOUT_BOUNDS_CONFIG = { fullPage: true, theme: 'vivid' }
  */
 (function (global) {
   'use strict';
 
   const currentScript = document.currentScript;
 
+  // Что и как собирать со страницы (вид — цвета, глубина, переключатели — в VIEW_DEFAULTS ниже)
   const DEFAULTS = {
-    target: null,            // элемент; по умолчанию вся страница
+    target: null,            // элемент или селектор; по умолчанию вся страница
     fullPage: false,         // false — только то, что видно на экране; true — вся страница
-    boxColor: 'depth',       // 'depth' — цвет по глубине вложенности; или один цвет: '#ff4d4f'
-    radius: true,            // скругления рамок как у элементов (border-radius)
-    fills: true,             // заливать рамку фоном элемента (сплошной цвет) — светлый текст на тёмных плашках остаётся читаемым
-    text: true,              // текст элементов
-    pseudoElements: true,    // ::before / ::after: absolute-декор (линии, подложки) и иконки-символы
-    textColor: 'original',   // 'original' — цвет текста со страницы; или один цвет: '#e5e7eb'
-    background: 'page',      // 'page' — фон страницы; или цвет: '#ffffff'
     media: 'box',            // картинки/SVG/canvas/video: 'box' — рамка с крестом; 'real' — само изображение
-    margins: false,          // закрашивать внешние отступы (margin), как в Android
-    padding: false,          // пунктиром показывать область содержимого (без padding)
+    radius: true,            // скругления рамок как у элементов (border-radius)
+    textColor: 'original',   // 'original' — цвет текста со страницы; или один цвет: '#e5e7eb'
+    pseudoElements: true,    // ::before / ::after: absolute-декор (линии, подложки) и иконки-символы
     labels: true,            // подсказка при наведении: тег, классы, размер
     iframes: true,           // заходить в same-origin iframe
     shadowDom: true,         // заходить в Shadow DOM
     minSize: 0,              // не рисовать рамки меньше N px по обеим сторонам
-    maxDepth: Infinity,      // глубина вложенности
+    maxDepth: Infinity,      // глубже не обходить
     maxElements: Infinity,   // сколько элементов обойти
-    filename: null,          // null — «сайт_2026-09-25_14-30-12_layout.html»
-    ui: true,                // всплывающие уведомления при download()
+    filename: null,          // имя файла; null — «сайт_дата_время_layout.html/png»
   };
 
-  const PALETTE = ['#ef4444', '#f59e0b', '#22c55e', '#06b6d4', '#3b82f6', '#a855f7', '#ec4899', '#84cc16'];
+  const VIVID = ['#ef4444', '#f59e0b', '#22c55e', '#06b6d4', '#3b82f6', '#a855f7', '#ec4899', '#84cc16'];
+  const MAX_D = 60; // глубже — один класс
   const MEDIA = new Set(['img', 'svg', 'canvas', 'video', 'picture', 'object', 'embed']);
   const SKIP = new Set(['script', 'style', 'noscript', 'template', 'link', 'meta', 'head', 'title', 'base']);
   const IGNORE = 'data-html-shot-ignore';
@@ -212,8 +209,8 @@
         const bg = opts.fills && pcs.backgroundColor && !/^(transparent|rgba\([^)]*,\s*0\s*\))$/.test(pcs.backgroundColor) ? `background-color:${pcs.backgroundColor};` : '';
         const radius = opts.radius && pcs.borderRadius && pcs.borderRadius !== '0px' ? `border-radius:${pcs.borderRadius};` : '';
         const title = opts.labels ? ` title="${esc(el.localName + which + '  ' + Math.round(pb.r - pb.l) + '×' + Math.round(pb.b - pb.t))}"` : '';
-        items.push(`<b class="b"${title} style="left:${px(pb.l)}px;top:${px(pb.t)}px;width:${px(pb.r - pb.l)}px;height:${px(pb.b - pb.t)}px;` +
-          `border-color:${boxColor(depth + 1, opts)};${bg}${radius}${clipCss(pb, clip)}"></b>`);
+        items.push(`<b class="b ${dcls(depth + 1, ctx)}"${title} style="left:${px(pb.l)}px;top:${px(pb.t)}px;width:${px(pb.r - pb.l)}px;height:${px(pb.b - pb.t)}px;` +
+          `${bg}${radius}${clipCss(pb, clip)}"></b>`);
       }
       if (opts.text && text.trim()) {
         const color = opts.textColor === 'original' ? pcs.color : opts.textColor;
@@ -242,8 +239,11 @@
       `  ${Math.round(r.r - r.l)}×${Math.round(r.b - r.t)}`;
   }
 
-  function boxColor(depth, opts) {
-    return opts.boxColor === 'depth' ? PALETTE[depth % PALETTE.length] : opts.boxColor;
+  // Класс глубины: цвет и видимость рамки задают правила темы (меняются без повторного обхода)
+  function dcls(depth, ctx) {
+    const d = Math.min(depth, MAX_D);
+    if (d > ctx.maxDepthSeen) ctx.maxDepthSeen = d;
+    return 'd' + d;
   }
 
   function clipCss(box, clip) {
@@ -348,10 +348,10 @@
           if (src) extra += `background-image:url(&quot;${esc(src)}&quot;);background-size:100% 100%;background-repeat:no-repeat;`;
         }
         const title = opts.labels ? ` title="${esc(describe(el, box))}"` : '';
-        const cls = 'b' + (isMedia && opts.media !== 'real' ? ' m' : '') + (tag === 'html' || tag === 'body' ? ' r' : '');
+        const cls = 'b ' + dcls(depth, ctx) + (isMedia && opts.media !== 'real' ? ' m' : '') + (tag === 'html' || tag === 'body' ? ' r' : '');
         out.push(`<b class="${cls}"${title} style="left:${px(box.l)}px;top:${px(box.t)}px;` +
-          `width:${px(box.r - box.l)}px;height:${px(box.b - box.t)}px;border-color:${boxColor(depth, opts)};${radius}${extra}${clipCss(box, myClip)}"></b>`);
-        if (opts.margins) {
+          `width:${px(box.r - box.l)}px;height:${px(box.b - box.t)}px;${radius}${extra}${clipCss(box, myClip)}"></b>`);
+        {  // margin и padding пишутся всегда, показываются переключателями
           const m = (p) => parseFloat(cs.getPropertyValue('margin-' + p)) || 0;
           const mt = m('top'), mr = m('right'), mb = m('bottom'), ml = m('left');
           if (mt > 0 || mr > 0 || mb > 0 || ml > 0) {
@@ -360,15 +360,15 @@
               `border-width:${px(Math.max(0, mt))}px ${px(Math.max(0, mr))}px ${px(Math.max(0, mb))}px ${px(Math.max(0, ml))}px;${clipCss(mbox, myClip)}"></b>`);
           }
         }
-        if (opts.padding) {
+        {
           const n = (p) => parseFloat(cs.getPropertyValue(p)) || 0;
           const inner = {
             l: box.l + n('border-left-width') + n('padding-left'), t: box.t + n('border-top-width') + n('padding-top'),
             r: box.r - n('border-right-width') - n('padding-right'), b: box.b - n('border-bottom-width') - n('padding-bottom'),
           };
           if (inner.r > inner.l && inner.b > inner.t && (inner.l > box.l + 0.5 || inner.t > box.t + 0.5)) {
-            out.push(`<b class="p" style="left:${px(inner.l)}px;top:${px(inner.t)}px;width:${px(inner.r - inner.l)}px;` +
-              `height:${px(inner.b - inner.t)}px;border-color:${boxColor(depth, opts)};${clipCss(inner, myClip)}"></b>`);
+            out.push(`<b class="p ${dcls(depth, ctx)}" style="left:${px(inner.l)}px;top:${px(inner.t)}px;width:${px(inner.r - inner.l)}px;` +
+              `height:${px(inner.b - inner.t)}px;${clipCss(inner, myClip)}"></b>`);
           }
         }
         // Поля ввода: их значение — тоже текст на экране
@@ -421,7 +421,7 @@
     for (const k of childNodesOf(el, opts)) walk(k, ctx, next, depth + 1, fo, childSC, childFlow);
   }
 
-  /* ---------------- сборка файла ---------------- */
+  /* ---------------- сбор данных ---------------- */
 
   function pageBackground() {
     const t = (c) => !c || c === 'transparent' || /rgba\([^)]*,\s*0\s*\)$/.test(c);
@@ -430,8 +430,16 @@
     return !t(h) ? h : !t(b) ? b : '#ffffff';
   }
 
-  async function toHTML(userOpts = {}) {
-    const opts = Object.assign({}, DEFAULTS, userOpts);
+  function isDarkColor(c) {
+    const m = /rgba?\(([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)/.exec(c || '');
+    if (!m) return false;
+    return (0.2126 * m[1] + 0.7152 * m[2] + 0.0722 * m[3]) / 255 < 0.45;
+  }
+
+  // Обходит страницу и собирает рамки и текст. Вид (цвета, глубина, переключатели) сюда
+  // не входит — он задаётся правилами CSS и меняется без повторного обхода.
+  async function collect(userOpts = {}) {
+    const opts = Object.assign({}, DEFAULTS, userOpts, { text: true, fills: true });
     if (typeof opts.target === 'string') opts.target = document.querySelector(opts.target);
     if (document.fonts && document.fonts.ready) await document.fonts.ready;
     const de = document.documentElement;
@@ -448,43 +456,140 @@
     } else {
       width = global.innerWidth; height = global.innerHeight;
     }
-    const ctx = { opts, count: 0, shiftX, shiftY, area: { l: 0, t: 0, r: width, b: height } };
+    const ctx = { opts, count: 0, maxDepthSeen: 0, shiftX, shiftY, area: { l: 0, t: 0, r: width, b: height } };
     const t0 = performance.now();
-    const root = isDoc ? de : opts.target;
-    const start = { clipAll: null, clipAbs: null, clipFixed: null, visible: true };
-    // fixed-элементы на всей странице стоят там, где их видно сейчас (как на скриншоте)
     const rootSC = newSC();
-    walk(root, ctx, start, 0, { x: 0, y: 0 }, rootSC, rootSC.flow);
+    // fixed-элементы на всей странице стоят там, где их видно сейчас (как на скриншоте)
+    walk(isDoc ? de : opts.target, ctx, { clipAll: null, clipAbs: null, clipFixed: null, visible: true }, 0, { x: 0, y: 0 }, rootSC, rootSC.flow);
     const items = flattenSC(rootSC, []);
+    const bg = pageBackground();
+    return {
+      items, width, height, bg, dark: isDarkColor(bg), maxDepth: ctx.maxDepthSeen,
+      elements: ctx.count, ms: Math.round(performance.now() - t0),
+      scrollY: isDoc && opts.fullPage ? global.scrollY : 0,
+    };
+  }
 
-    const bg = opts.background === 'page' ? pageBackground() : opts.background;
-    const html = `<!DOCTYPE html>
+  /* ---------------- вид: темы и переключатели ---------------- */
+
+  const VIEW_DEFAULTS = {
+    theme: 'soft',      // 'soft' — спокойные рамки одного оттенка; 'mono' — свой цвет; 'vivid' — яркие по глубине
+    color: '#60a5fa',   // цвет для 'mono'
+    opacity: 0.55,      // яркость рамок 0..1
+    depthFrom: 0,       // показывать рамки с этой глубины…
+    depthTo: Infinity,  // …по эту
+    text: true,         // текст
+    fills: true,        // заливка фоном элемента
+    margins: false,     // внешние отступы
+    padding: false,     // область содержимого пунктиром
+    overlay: false,     // «поверх страницы»: прозрачный фон, только рамки
+  };
+
+  function rgba(hex, a) {
+    const m = /^#?([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i.exec(hex || '');
+    if (!m) return hex;
+    return `rgba(${parseInt(m[1], 16)},${parseInt(m[2], 16)},${parseInt(m[3], 16)},${a})`;
+  }
+
+  function borderColor(d, view, dark) {
+    const a = Math.max(0.05, Math.min(1, view.opacity));
+    if (view.theme === 'vivid') return rgba(VIVID[d % VIVID.length], a);
+    if (view.theme === 'mono') return rgba(view.color, a);
+    // soft: один спокойный оттенок, глубина — лёгкая смена светлоты
+    const l = dark ? 74 - (d % 5) * 5 : 40 + (d % 5) * 5;
+    return `hsla(214,42%,${l}%,${a})`;
+  }
+
+  function themeCSS(data, view) {
+    let css = `html,body{background:${view.overlay ? 'transparent' : data.bg}}\n`;
+    for (let d = 0; d <= data.maxDepth; d++) {
+      const on = d >= view.depthFrom && d <= view.depthTo;
+      css += on ? `.d${d}{border-color:${borderColor(d, view, data.dark)}}\n`
+        : `.d${d}{border-color:transparent}.b.d${d}{pointer-events:none}\n`;
+    }
+    return css;
+  }
+
+  function viewClasses(view) {
+    return [!view.text || view.overlay ? 'nt' : '', !view.fills || view.overlay ? 'nf' : '',
+      view.margins ? 'sm' : '', view.padding ? 'sp' : ''].filter(Boolean).join(' ');
+  }
+
+  const BASE_CSS = `html,body{margin:0}
+#L{position:relative;overflow:hidden}
+.b,.g,.p,.t{position:absolute;box-sizing:border-box;margin:0;padding:0}
+.b{border:1px solid transparent;background-clip:padding-box}
+.b:hover{box-shadow:inset 0 0 0 999px rgba(96,165,250,.14);border-color:#60a5fa!important}
+.r{pointer-events:none}
+.m{background-image:linear-gradient(to top right,transparent calc(50% - .5px),currentColor calc(50% - .5px),currentColor calc(50% + .5px),transparent calc(50% + .5px)),linear-gradient(to bottom right,transparent calc(50% - .5px),currentColor calc(50% - .5px),currentColor calc(50% + .5px),transparent calc(50% + .5px));color:rgba(148,163,184,.35)}
+.g{border-style:solid;border-color:rgba(251,191,36,.16);pointer-events:none}
+.p{border:1px dashed;pointer-events:none}
+.t{white-space:pre;overflow:visible;pointer-events:none;font-style:normal}
+#L.nt .t{display:none}
+#L.nf .b{background-color:transparent!important}
+#L:not(.sm) .g,#L:not(.sp) .p{display:none}`;
+
+  function buildDoc(data, view) {
+    return `<!DOCTYPE html>
 <!-- layout bounds of ${esc(location.href)} at ${new Date().toISOString()} by layout-bounds.js -->
 <html><head><meta charset="utf-8"><title>Границы макета — ${esc(document.title || location.hostname)}</title>
-<style>
-html,body{margin:0;background:${bg}}
-#L{position:relative;width:${width}px;height:${height}px;overflow:hidden}
-.b,.g,.p,.t{position:absolute;box-sizing:border-box;margin:0;padding:0}
-.b{border:1px solid;background-clip:padding-box}
-.b:hover{box-shadow:inset 0 0 0 999px rgba(255,64,64,.18);border-color:#ff4040!important}
-.r{pointer-events:none}
-.m{background-image:linear-gradient(to top right,transparent calc(50% - .5px),currentColor calc(50% - .5px),currentColor calc(50% + .5px),transparent calc(50% + .5px)),linear-gradient(to bottom right,transparent calc(50% - .5px),currentColor calc(50% - .5px),currentColor calc(50% + .5px),transparent calc(50% + .5px));color:rgba(128,128,128,.5)}
-.g{border-style:solid;border-color:rgba(236,72,153,.28);pointer-events:none}
-.p{border:1px dashed;opacity:.55;pointer-events:none}
-.t{white-space:pre;overflow:visible;pointer-events:none;font-style:normal}
-</style></head><body><div id="L">
-${items.join('\n')}
+<style id="lb-base">${BASE_CSS}</style>
+<style id="lb-theme">${themeCSS(data, view)}</style>
+</head><body><div id="L" class="${viewClasses(view)}" style="width:${data.width}px;height:${data.height}px">
+${data.items.join('\n')}
 </div></body></html>`;
-    api.lastReport = { elements: ctx.count, items: items.length, width, height, ms: Math.round(performance.now() - t0), bytes: html.length };
-    return html;
+  }
+
+  function applyView(doc, data, view) {
+    doc.getElementById('lb-theme').textContent = themeCSS(data, view);
+    doc.getElementById('L').className = viewClasses(view);
+  }
+
+  /* ---------------- PNG ---------------- */
+
+  async function inlineMedia(root) {
+    await Promise.all([...root.querySelectorAll('.b[style*="url("]')].map(async (el) => {
+      const m = /url\(["']?((?!data:)[^"')]+)["']?\)/.exec(el.getAttribute('style'));
+      if (!m) return;
+      try {
+        const blob = await (await fetch(m[1], { mode: 'cors' })).blob();
+        const data = await new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(blob); });
+        el.setAttribute('style', el.getAttribute('style').replace(m[1], data));
+      } catch (_) { /* чужой сервер без CORS — останется пустым */ }
+    }));
+  }
+
+  // Рисует собранный документ в PNG через SVG <foreignObject>: в нём только простые блоки и текст
+  async function renderPNG(doc, data) {
+    const w = data.width, h = data.height;
+    const dpr = global.devicePixelRatio || 1;
+    const scale = Math.max(0.1, Math.min(dpr, 32767 / w, 32767 / h, Math.sqrt(268435456 / (w * h))));
+    const wrap = doc.createElement('div');
+    const st = doc.createElement('style');
+    st.textContent = doc.getElementById('lb-base').textContent + '\n' + doc.getElementById('lb-theme').textContent +
+      `\ndiv.lb-wrap{width:${w}px;height:${h}px;background:${doc.defaultView.getComputedStyle(doc.body).backgroundColor}}`;
+    wrap.className = 'lb-wrap';
+    wrap.appendChild(st);
+    const L = doc.getElementById('L').cloneNode(true);
+    L.querySelectorAll('[title]').forEach((e) => e.removeAttribute('title'));
+    wrap.appendChild(L);
+    await inlineMedia(wrap);
+    const xml = new XMLSerializer().serializeToString(wrap);
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}"><foreignObject width="100%" height="100%">${xml}</foreignObject></svg>`;
+    const img = new Image();
+    await new Promise((res, rej) => { img.onload = res; img.onerror = () => rej(new Error('Браузер не смог нарисовать PNG')); img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg); });
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(w * scale); canvas.height = Math.round(h * scale);
+    canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+    return new Promise((res, rej) => canvas.toBlob((b) => (b ? res(b) : rej(new Error('Не удалось собрать PNG'))), 'image/png'));
   }
 
   /* ---------------- сохранение ---------------- */
 
-  function autoFilename() {
+  function autoFilename(ext) {
     const d = new Date(), p = (n) => String(n).padStart(2, '0');
     const host = (location.hostname || 'page').replace(/[^\w.-]+/g, '_');
-    return `${host}_${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}_layout.html`;
+    return `${host}_${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}_layout.${ext}`;
   }
 
   function saveBlob(blob, name) {
@@ -498,38 +603,215 @@ ${items.join('\n')}
     setTimeout(() => URL.revokeObjectURL(a.href), 30000);
   }
 
-  function toast(text, ok) {
-    const el = document.createElement('div');
-    el.setAttribute(IGNORE, '');
-    el.style.cssText = 'all:initial;position:fixed;z-index:2147483647;right:16px;bottom:16px;padding:12px 14px;border-radius:10px;' +
-      'font:14px/1.35 system-ui,sans-serif;color:#fff;white-space:pre-line;box-shadow:0 6px 24px rgba(0,0,0,.35);background:' +
-      (ok ? '#1b5e20' : '#c62828');
-    el.textContent = text;
-    document.documentElement.appendChild(el);
-    setTimeout(() => el.remove(), ok ? 4000 : 10000);
+  // Документ во временном скрытом iframe — чтобы применить вид и нарисовать PNG без панели
+  async function withDoc(html, fn) {
+    const f = document.createElement('iframe');
+    f.setAttribute(IGNORE, '');
+    f.style.cssText = 'position:fixed;left:-10000px;top:0;width:10px;height:10px;border:0;visibility:hidden';
+    document.documentElement.appendChild(f);
+    try {
+      await new Promise((res) => { f.onload = res; f.srcdoc = html; });
+      return await fn(f.contentDocument);
+    } finally { f.remove(); }
+  }
+
+  const split = (o) => {
+    const view = Object.assign({}, VIEW_DEFAULTS);
+    const rest = {};
+    Object.keys(o || {}).forEach((k) => { if (k in VIEW_DEFAULTS) view[k] = o[k]; else rest[k] = o[k]; });
+    return { view, rest };
+  };
+
+  async function toHTML(userOpts = {}) {
+    const { view, rest } = split(userOpts);
+    const data = await collect(rest);
+    api.lastReport = { elements: data.elements, items: data.items.length, width: data.width, height: data.height, ms: data.ms };
+    return buildDoc(data, view);
+  }
+
+  async function toPNG(userOpts = {}) {
+    const { view, rest } = split(userOpts);
+    const data = await collect(rest);
+    return withDoc(buildDoc(data, view), (doc) => renderPNG(doc, data));
   }
 
   async function download(userOpts = {}) {
-    const opts = Object.assign({}, DEFAULTS, userOpts);
-    try {
-      const html = await toHTML(opts);
-      const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
-      const name = opts.filename || autoFilename();
-      saveBlob(blob, name);
-      const r = api.lastReport;
-      if (opts.ui) toast(`✅ Сохранено: ${name}\n${r.items} рамок и строк, ${(blob.size / 1024).toFixed(0)} КБ, ${(r.ms / 1000).toFixed(1)} с`, true);
-      return blob;
-    } catch (err) {
-      if (opts.ui) toast('❌ Не удалось сохранить:\n' + ((err && err.message) || err), false);
-      throw err;
-    }
+    const blob = new Blob([await toHTML(userOpts)], { type: 'text/html;charset=utf-8' });
+    saveBlob(blob, userOpts.filename || autoFilename('html'));
+    return blob;
   }
 
-  const api = { version: '1.0', toHTML, download, defaults: DEFAULTS, lastReport: null };
+  async function downloadPNG(userOpts = {}) {
+    const blob = await toPNG(userOpts);
+    saveBlob(blob, userOpts.filename || autoFilename('png'));
+    return blob;
+  }
+
+  /* ---------------- панель ---------------- */
+
+  const PANEL_CSS = `:host{all:initial}
+.p{position:fixed;top:12px;right:12px;width:268px;z-index:2147483647;background:rgba(15,18,25,.94);color:#e5e7eb;
+  font:12px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;border:1px solid rgba(255,255,255,.08);border-radius:12px;
+  box-shadow:0 12px 32px rgba(0,0,0,.45);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);user-select:none}
+.h{display:flex;align-items:center;gap:4px;padding:9px 10px 9px 12px;cursor:move;border-bottom:1px solid rgba(255,255,255,.06)}
+.h b{flex:1;font-weight:600;font-size:13px;letter-spacing:.01em}
+.x{background:none;border:0;color:#9ca3af;cursor:pointer;font:14px system-ui,sans-serif;width:24px;height:22px;border-radius:6px}
+.x:hover{background:rgba(255,255,255,.08);color:#fff}
+.c{padding:10px 12px 12px;display:grid;gap:11px}
+.p.min .c{display:none}
+.row{display:grid;gap:5px}
+.lab{display:flex;justify-content:space-between;align-items:center;color:#9ca3af}
+.v{color:#e5e7eb;font-variant-numeric:tabular-nums}
+input[type=range]{width:100%;margin:0;accent-color:#60a5fa}
+.seg{display:flex;background:rgba(255,255,255,.05);border-radius:8px;padding:2px;gap:2px}
+.seg button{flex:1;background:none;border:0;color:#9ca3af;padding:5px 0;border-radius:6px;cursor:pointer;font:inherit}
+.seg button:hover{color:#e5e7eb}
+.seg button.on{background:rgba(96,165,250,.2);color:#fff}
+.chk{display:grid;grid-template-columns:1fr 1fr;gap:6px 8px}
+.chk label{display:flex;align-items:center;gap:6px;cursor:pointer;color:#d1d5db}
+.chk label.w{grid-column:1/-1}
+input[type=checkbox]{margin:0;accent-color:#60a5fa}
+input[type=color]{width:26px;height:18px;border:1px solid rgba(255,255,255,.15);border-radius:4px;background:none;padding:0;cursor:pointer}
+.dl{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.btn{background:#2563eb;border:0;color:#fff;border-radius:8px;padding:8px 0;font:600 12px system-ui,sans-serif;cursor:pointer}
+.btn:hover{background:#1d4ed8}
+.btn.sec{background:rgba(255,255,255,.07);color:#d1d5db;font-weight:500}
+.btn.sec:hover{background:rgba(255,255,255,.12)}
+.btn:disabled{opacity:.5;cursor:default}
+.st{color:#6b7280;font-size:11px;min-height:15px}`;
+
+  const PANEL_HTML = `<div class="p">
+  <div class="h"><b>Границы макета</b><button class="x" data-a="min" title="Свернуть">–</button><button class="x" data-a="close" title="Закрыть (Esc)">✕</button></div>
+  <div class="c">
+    <div class="row"><div class="lab"><span>Глубина от</span><span class="v" id="vf"></span></div><input type="range" id="from" min="0" step="1"></div>
+    <div class="row"><div class="lab"><span>Глубина до</span><span class="v" id="vt"></span></div><input type="range" id="to" min="0" step="1"></div>
+    <div class="row"><div class="lab"><span>Рамки</span><input type="color" id="color" title="Свой цвет"></div>
+      <div class="seg" id="theme"><button data-v="soft">Мягкие</button><button data-v="mono">Свой цвет</button><button data-v="vivid">Яркие</button></div></div>
+    <div class="row"><div class="lab"><span>Яркость рамок</span><span class="v" id="vo"></span></div><input type="range" id="opacity" min="5" max="100" step="1"></div>
+    <div class="chk">
+      <label><input type="checkbox" id="text">Текст</label><label><input type="checkbox" id="fills">Заливка</label>
+      <label><input type="checkbox" id="margins">Отступы</label><label><input type="checkbox" id="padding">Поля</label>
+      <label class="w" title="Прозрачный фон: только рамки поверх настоящей страницы"><input type="checkbox" id="overlay">Поверх страницы</label>
+    </div>
+    <div class="row"><div class="lab"><span>Область</span></div><div class="seg" id="scope"><button data-v="view">Экран</button><button data-v="page">Вся страница</button></div></div>
+    <div class="row"><div class="lab"><span>Картинки</span></div><div class="seg" id="media"><button data-v="box">Рамкой</button><button data-v="real">Как есть</button></div></div>
+    <div class="dl"><button class="btn" id="html">Скачать HTML</button><button class="btn" id="png">Скачать PNG</button></div>
+    <div class="dl"><button class="btn sec" id="refresh" title="Снять заново (страница могла измениться)">Обновить</button><span class="st" id="st"></span></div>
+  </div>
+</div>`;
+
+  let panel = null;
+
+  async function open(userOpts = {}) {
+    if (panel) return panel.api;
+    const { view, rest } = split(userOpts);
+    const opts = Object.assign({ fullPage: false, media: 'box' }, rest);
+
+    const frame = document.createElement('iframe');
+    frame.setAttribute(IGNORE, '');
+    frame.setAttribute('aria-hidden', 'true');
+    frame.style.cssText = 'position:fixed;inset:0;width:100vw;height:100vh;border:0;margin:0;padding:0;z-index:2147483646;background:transparent;color-scheme:normal';
+    const host = document.createElement('div');
+    host.setAttribute(IGNORE, '');
+    const root = host.attachShadow({ mode: 'open' });
+    root.innerHTML = `<style>${PANEL_CSS}</style>${PANEL_HTML}`;
+    const $ = (id) => root.getElementById(id);
+    const box = root.querySelector('.p');
+
+    let data = null;
+    const status = (t) => { $('st').textContent = t; };
+    const doc = () => frame.contentDocument;
+
+    function syncControls() {
+      const max = data.maxDepth;
+      const to = Math.min(view.depthTo, max), from = Math.min(view.depthFrom, max);
+      $('from').max = max; $('to').max = max;
+      $('from').value = from; $('to').value = to;
+      $('vf').textContent = from; $('vt').textContent = to === max ? `${to} (все)` : to;
+      $('opacity').value = Math.round(view.opacity * 100); $('vo').textContent = Math.round(view.opacity * 100) + '%';
+      $('color').value = view.color;
+      ['text', 'fills', 'margins', 'padding', 'overlay'].forEach((k) => { $(k).checked = !!view[k]; });
+      root.querySelectorAll('#theme button').forEach((b) => b.classList.toggle('on', b.dataset.v === view.theme));
+      root.querySelectorAll('#scope button').forEach((b) => b.classList.toggle('on', (b.dataset.v === 'page') === !!opts.fullPage));
+      root.querySelectorAll('#media button').forEach((b) => b.classList.toggle('on', b.dataset.v === opts.media));
+    }
+
+    function refreshView() {
+      if (data && doc() && doc().getElementById('L')) applyView(doc(), data, view);
+      syncControls();
+    }
+
+    async function capture() {
+      status('Снимаю…');
+      frame.style.visibility = 'hidden';
+      await new Promise((r) => requestAnimationFrame(() => r()));
+      data = await collect(opts);
+      await new Promise((res) => { frame.onload = res; frame.srcdoc = buildDoc(data, view); });
+      if (data.scrollY) frame.contentWindow.scrollTo(0, data.scrollY);
+      frame.style.visibility = 'visible';
+      refreshView();
+      status(`${data.elements} элементов · ${data.ms} мс`);
+    }
+
+    // Управление
+    $('from').addEventListener('input', (e) => { view.depthFrom = +e.target.value; if (view.depthFrom > view.depthTo) view.depthTo = view.depthFrom; refreshView(); });
+    $('to').addEventListener('input', (e) => { const v = +e.target.value; view.depthTo = v >= data.maxDepth ? Infinity : v; if (view.depthFrom > v) view.depthFrom = v; refreshView(); });
+    $('opacity').addEventListener('input', (e) => { view.opacity = +e.target.value / 100; refreshView(); });
+    $('color').addEventListener('input', (e) => { view.color = e.target.value; view.theme = 'mono'; refreshView(); });
+    ['text', 'fills', 'margins', 'padding', 'overlay'].forEach((k) => $(k).addEventListener('change', (e) => { view[k] = e.target.checked; refreshView(); }));
+    $('theme').addEventListener('click', (e) => { const v = e.target.dataset && e.target.dataset.v; if (v) { view.theme = v; refreshView(); } });
+    $('scope').addEventListener('click', (e) => { const v = e.target.dataset && e.target.dataset.v; if (v && (v === 'page') !== !!opts.fullPage) { opts.fullPage = v === 'page'; capture(); } });
+    $('media').addEventListener('click', (e) => { const v = e.target.dataset && e.target.dataset.v; if (v && v !== opts.media) { opts.media = v; capture(); } });
+    $('refresh').addEventListener('click', () => capture());
+    $('html').addEventListener('click', () => {
+      const html = '<!DOCTYPE html>\n' + doc().documentElement.outerHTML;
+      saveBlob(new Blob([html], { type: 'text/html;charset=utf-8' }), autoFilename('html'));
+      status('HTML сохранён');
+    });
+    $('png').addEventListener('click', async () => {
+      $('png').disabled = true; status('Рисую PNG…');
+      try { saveBlob(await renderPNG(doc(), data), autoFilename('png')); status('PNG сохранён'); }
+      catch (err) { status('❌ ' + (err.message || err)); }
+      finally { $('png').disabled = false; }
+    });
+
+    // Перетаскивание за заголовок, свернуть, закрыть
+    root.querySelector('.h').addEventListener('mousedown', (e) => {
+      if (e.target.closest('button')) return;
+      const r = box.getBoundingClientRect(), dx = e.clientX - r.left, dy = e.clientY - r.top;
+      const move = (ev) => { box.style.left = Math.max(0, ev.clientX - dx) + 'px'; box.style.top = Math.max(0, ev.clientY - dy) + 'px'; box.style.right = 'auto'; };
+      const up = () => { removeEventListener('mousemove', move, true); removeEventListener('mouseup', up, true); };
+      addEventListener('mousemove', move, true); addEventListener('mouseup', up, true);
+      e.preventDefault();
+    });
+    root.querySelector('[data-a="min"]').addEventListener('click', () => box.classList.toggle('min'));
+    const onKey = (e) => { if (e.key === 'Escape') close(); };
+    root.querySelector('[data-a="close"]').addEventListener('click', () => close());
+
+    function close() {
+      removeEventListener('keydown', onKey, true);
+      frame.remove(); host.remove(); panel = null;
+    }
+
+    addEventListener('keydown', onKey, true);
+    document.documentElement.appendChild(frame);
+    document.documentElement.appendChild(host);
+    await capture();
+    panel = { api: { close, refresh: capture, view, opts } };
+    return panel.api;
+  }
+
+  function close() { if (panel) panel.api.close(); }
+
+  const api = {
+    version: '2.0', open, close, toHTML, toPNG, download, downloadPNG,
+    defaults: DEFAULTS, viewDefaults: VIEW_DEFAULTS, lastReport: null,
+  };
   global.layoutBounds = api;
 
+  // Вставили в консоль — открывается панель. Настройки: window.LAYOUT_BOUNDS_CONFIG = { fullPage: true, theme: 'mono' }
   if (!(currentScript && currentScript.hasAttribute('data-manual'))) {
-    const run = () => api.download(global.LAYOUT_BOUNDS_CONFIG || {}).catch(() => { /* показано в уведомлении */ });
+    const run = () => open(global.LAYOUT_BOUNDS_CONFIG || {}).catch((e) => console.error('[layoutBounds]', e));
     document.readyState === 'complete' ? run() : global.addEventListener('load', run, { once: true });
   }
 })(typeof window !== 'undefined' ? window : this);
