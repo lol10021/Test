@@ -14,9 +14,13 @@
  *        const blob   = await htmlShot.toBlob({ type: 'image/jpeg', quality: 0.9 });
  *   Элементы с атрибутом data-html-shot-ignore не попадают в скриншот.
  *   htmlShot.download({ debug: true }) — открыть копию в новой вкладке для инспекции.
+ *   htmlShot.inspect('селектор') — почему конкретного элемента нет на снимке (текст отчёта — в консоль).
  *   htmlShot.diagnose() — найти элементы, которые в копии съехали, и показать, из-за каких стилей.
  *   await htmlShot.captureTab()  — захват вкладки (видит всё, но спросит разрешение; нужен клик).
  *   htmlShot.lastReport          — что не удалось встроить в последний снимок.
+ *
+ * Новое в v7.4: блоки за краем с absolute/transform-содержимым (ручки-разделители) больше не
+ *   выкидываются; htmlShot.inspect(селектор) — разбор, почему элемента нет на снимке.
  *
  * Новое в v7.3: элементы ставятся на место через left/top, а не transform — ручки-разделители
  *   и другие элементы с z-index поверх соседних панелей больше не пропадают.
@@ -533,14 +537,15 @@
     return true;
   }
 
-  // Строка/группа, прокрученная за край, может держать внутри «прилипший» элемент
-  // (шапка таблицы, заголовок группы) — он виден, выкидывать такое поддерево нельзя.
-  // Большие поддеревья не проверяем до конца и считаем, что sticky там может быть.
-  function hasStickyInside(node, win) {
+  // Блок за краем может держать внутри то, что всё равно видно: «прилипший» заголовок,
+  // absolute-полоску (ручка-разделитель), сдвинутый transform-ом элемент. Такое поддерево
+  // выкидывать нельзя. Большие поддеревья не проверяем до конца и считаем, что такое там есть.
+  function hasEscapingInside(node, win) {
     const it = node.ownerDocument.createTreeWalker(node, NodeFilter.SHOW_ELEMENT);
     for (let n = it.nextNode(), budget = 300; n; n = it.nextNode()) {
       if (--budget < 0) return true;
-      if (win.getComputedStyle(n).position === 'sticky') return true;
+      const cs = win.getComputedStyle(n);
+      if (cs.position !== 'static' || cs.transform !== 'none' || (cs.translate || 'none') !== 'none') return true;
     }
     return false;
   }
@@ -581,7 +586,8 @@
     const inFlow = cs.position === 'static' || cs.position === 'relative' || cs.position === 'sticky';
     if (clip && isHTML && !flags.isRoot && inFlow && BLOCKISH.test(cs.display)) {
       rect = node.getBoundingClientRect();
-      culled = !intersects(rect, clip) && !hasStickyInside(node, win);
+      // Блок нулевой ширины/высоты весь состоит из «вылезающего» содержимого — не выкидываем
+      culled = rect.width > 0 && rect.height > 0 && !intersects(rect, clip) && !hasEscapingInside(node, win);
       const untransformed = cs.transform === 'none' && (cs.translate || 'none') === 'none';
       if (culled && flags.dropBelow && rect.top >= clip.bottom && untransformed &&
           (cs.position === 'static' || (cs.position === 'relative' && /^(auto|0px)$/.test(cs.top)))) return null;
@@ -605,7 +611,7 @@
     if (ctx.pairs) {
       pairIdx = ctx.pairs.push({
         node, el, parent: flags.pIdx === undefined ? -1 : flags.pIdx, inFixed, frame: flags.frame || null,
-        rtl: cs.direction === 'rtl',
+        rtl: cs.direction === 'rtl', culled: false,
         movable: isHTML && !flags.warped && canTranslate(cloneTag, cs.display),
       }) - 1;
     }
@@ -657,7 +663,7 @@
     }
     setStyle(el, style, doc.baseURI, ctx);
 
-    if (culled) return el;
+    if (culled) { if (pairIdx >= 0) ctx.pairs[pairIdx].culled = true; return el; }
 
     // Псевдоэлементы ::before / ::after
     if (isHTML && !NO_CHILDREN.has(tag)) {
@@ -1502,13 +1508,111 @@
     }
   }
 
-  const api = { version: 7, capture, toBlob, toDataURL: toDataURLApi, download, captureTab, diagnose, defaults: DEFAULTS, lastReport: null };
+  // Разбор одного элемента, которого нет на снимке: попал ли он в копию, где стоит,
+  // и кто его перекрывает. Текст отчёта печатается в консоль — его можно скопировать целиком.
+  //   htmlShot.inspect('[data-sentry-component="ResizeHandleBar"]')
+  const STACK_PROPS = ['position', 'z-index', 'display', 'width', 'height', 'left', 'top', 'overflow', 'opacity',
+    'transform', 'filter', 'isolation', 'contain', 'will-change', 'mix-blend-mode', 'background-color', 'visibility'];
+
+  function describeEl(el) {
+    if (!el) return '(ничего)';
+    if (el.nodeType !== 1) return '#text';
+    const cls = typeof el.className === 'string' ? el.className.trim().split(/\s+/).slice(0, 4).join('.') : '';
+    const sentry = el.getAttribute && el.getAttribute('data-sentry-component');
+    return el.localName + (el.id ? '#' + el.id : '') + (cls ? '.' + cls : '') + (sentry ? ` [${sentry}]` : '');
+  }
+
+  function propsLine(cs) {
+    return STACK_PROPS.map((p) => {
+      const v = cs.getPropertyValue(p);
+      return v && v !== 'auto' && v !== 'none' && v !== 'normal' && v !== 'visible' && v !== '1' && v !== 'static' ? `${p}:${v}` : '';
+    }).filter(Boolean).join('; ');
+  }
+
+  async function inspect(target, userOpts = {}) {
+    const node = typeof target === 'string' ? document.querySelector(target) : target;
+    if (!node) { console.warn('[htmlShot] inspect: элемент не найден:', target); return null; }
+    const opts = Object.assign({}, DEFAULTS, userOpts);
+    const lines = [];
+    const log = (s) => lines.push(s);
+    const restore = await preparePage(opts);
+    let frame = null;
+    try {
+      const built = await buildClone(opts, true);
+      const { root, ctx, width, height, isDoc } = built;
+      const pairs = ctx.pairs;
+      const expected = expectedPositions(pairs, opts, isDoc, built.target);
+      ({ frame } = await layoutInFrame(root, width, height, opts));
+      alignToOriginal(pairs, expected);
+      const fdoc = frame.contentDocument;
+      const byCopy = new Map(pairs.map((p) => [p.el, p.node]));
+      const origOf = (c) => { for (let e = c; e; e = e.parentElement) if (byCopy.has(e)) return byCopy.get(e); return null; };
+
+      const r = node.getBoundingClientRect();
+      log(`htmlShot v${api.version} inspect: ${describeEl(node)}`);
+      log(`снимок ${width}x${height}, fullPage:${opts.fullPage}, scroll ${global.scrollX},${global.scrollY}, окно ${global.innerWidth}x${global.innerHeight}`);
+      log(`оригинал: x ${r.left.toFixed(1)} y ${r.top.toFixed(1)} ${r.width.toFixed(1)}x${r.height.toFixed(1)}`);
+      const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+      const topOrig = document.elementFromPoint(cx, cy);
+      log(`сверху в оригинале (центр элемента): ${describeEl(topOrig)}`);
+
+      const idx = pairs.findIndex((p) => p.node === node);
+      if (idx < 0) {
+        log('В КОПИЮ НЕ ПОПАЛ. Цепочка предков:');
+        for (let a = node.parentElement; a; a = a.parentElement) {
+          const pi = pairs.findIndex((p) => p.node === a);
+          log(`  ${describeEl(a)} — ${pi < 0 ? 'нет в копии' : pairs[pi].culled ? 'в копии, НО СОДЕРЖИМОЕ ВЫКИНУТО (за краем)' : 'в копии'}`);
+          if (pi >= 0) break;
+        }
+      } else {
+        const pair = pairs[idx];
+        const c = pair.el.getBoundingClientRect();
+        const e = expected[idx];
+        log(`копия:    x ${c.left.toFixed(1)} y ${c.top.toFixed(1)} ${c.width.toFixed(1)}x${c.height.toFixed(1)}` +
+          (e ? `  (должен быть x ${e.x.toFixed(1)} y ${e.y.toFixed(1)})` : '') + (pair.culled ? '  СОДЕРЖИМОЕ ВЫКИНУТО' : ''));
+        const hit = fdoc.elementFromPoint(c.left + c.width / 2, c.top + c.height / 2);
+        const hitOrig = origOf(hit);
+        log(`сверху в копии (центр элемента): ${describeEl(hitOrig)}${hit && hit.localName === 'html2canvaspseudoelement' ? ' (псевдоэлемент)' : ''}` +
+          (hitOrig === node || (hitOrig && node.contains(hitOrig)) ? '  — элемент виден' : '  — ЭЛЕМЕНТ ПЕРЕКРЫТ'));
+        log('Цепочка (оригинал | копия):');
+        const fwin = fdoc.defaultView;
+        for (let i = idx, depth = 0; i >= 0 && depth < 12; i = pairs[i].parent, depth++) {
+          const p = pairs[i];
+          const oc = p.node.ownerDocument.defaultView.getComputedStyle(p.node);
+          let cc = null;
+          try { cc = fwin.getComputedStyle(p.el); } catch (_) {}
+          log(`  ${describeEl(p.node)}`);
+          log(`    оригинал: ${propsLine(oc)}`);
+          log(`    копия:    ${cc ? propsLine(cc) : '?'}`);
+        }
+        if (hitOrig && hitOrig !== node && !node.contains(hitOrig)) {
+          log(`Перекрывающий элемент и его предки:`);
+          const hi = pairs.findIndex((p) => p.node === hitOrig);
+          for (let i = hi, depth = 0; i >= 0 && depth < 8; i = pairs[i].parent, depth++) {
+            const p = pairs[i];
+            let cc = null;
+            try { cc = fwin.getComputedStyle(p.el); } catch (_) {}
+            log(`  ${describeEl(p.node)} | копия: ${cc ? propsLine(cc) : '?'}`);
+          }
+        }
+      }
+    } finally {
+      if (frame) frame.remove();
+      restore();
+      cleanupSandbox();
+    }
+    const text = lines.join('\n');
+    console.log(text);
+    return text;
+  }
+
+  const api = { version: '7.4', capture, toBlob, toDataURL: toDataURLApi, download, captureTab, diagnose, inspect, defaults: DEFAULTS, lastReport: null };
   global.htmlShot = api;
 
   // Автозапуск (если вставили в консоль или подключили без data-manual)
   if (!(currentScript && currentScript.hasAttribute('data-manual'))) {
     const run = () => {
-      console.log('[htmlShot] v7: делаю скриншот…');
+      console.log('[htmlShot] v7.4: делаю скриншот…');
       console.time('[htmlShot]');
       // Настройки без правки файла: window.HTML_SHOT_CONFIG = { fullPage: true, method: 'tab' }
       api.download(global.HTML_SHOT_CONFIG || {})
