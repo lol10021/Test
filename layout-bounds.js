@@ -7,7 +7,8 @@
  * сайта не копируется: всё измеряется у браузера (getBoundingClientRect, Range.getClientRects).
  *
  * Вставьте в консоль — поверх страницы откроется предпросмотр и панель:
- *   глубина «от» и «до», цвет и яркость рамок, текст, заливка, отступы, поля, «поверх страницы»,
+ *   глубина «от» и «до», цвет и яркость рамок, фон (сайт/тёмный/светлый/свой), цвет текста
+ *   (как на сайте / контрастный), текст, заливка, отступы, поля, «поверх страницы»,
  *   область (экран / вся страница), картинки (рамкой / как есть), «Скачать HTML», «Скачать PNG».
  *   Панель перетаскивается за заголовок, Esc — закрыть. Наведите мышь на рамку — подсказка
  *   с тегом, классами и размером.
@@ -431,9 +432,13 @@
   }
 
   function isDarkColor(c) {
+    let rgb = null;
     const m = /rgba?\(([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)/.exec(c || '');
-    if (!m) return false;
-    return (0.2126 * m[1] + 0.7152 * m[2] + 0.0722 * m[3]) / 255 < 0.45;
+    if (m) rgb = [+m[1], +m[2], +m[3]];
+    const h = /^#([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i.exec(c || '');
+    if (h) rgb = [parseInt(h[1], 16), parseInt(h[2], 16), parseInt(h[3], 16)];
+    if (!rgb) return false;
+    return (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) / 255 < 0.45;
   }
 
   // Обходит страницу и собирает рамки и текст. Вид (цвета, глубина, переключатели) сюда
@@ -483,7 +488,16 @@
     margins: false,     // внешние отступы
     padding: false,     // область содержимого пунктиром
     overlay: false,     // «поверх страницы»: прозрачный фон, только рамки
+    background: 'page', // фон: 'page' — как на сайте; 'dark'; 'light'; или свой цвет '#1e293b'
+    textMode: 'original', // текст: 'original' — цвета сайта; 'contrast' — один цвет, читаемый на выбранном фоне
   };
+
+  const BG_PRESETS = { dark: '#0f1115', light: '#f8fafc' };
+
+  function effectiveBg(data, view) {
+    if (view.background === 'page' || !view.background) return data.bg;
+    return BG_PRESETS[view.background] || view.background;
+  }
 
   function rgba(hex, a) {
     const m = /^#?([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i.exec(hex || '');
@@ -501,10 +515,13 @@
   }
 
   function themeCSS(data, view) {
-    let css = `html,body{background:${view.overlay ? 'transparent' : data.bg}}\n`;
+    const bg = effectiveBg(data, view);
+    const dark = view.overlay ? data.dark : isDarkColor(bg);
+    let css = `html,body{background:${view.overlay ? 'transparent' : bg}}\n`;
+    if (view.textMode === 'contrast') css += `#L .t{color:${dark ? '#e5e7eb' : '#111827'}!important}\n`;
     for (let d = 0; d <= data.maxDepth; d++) {
       const on = d >= view.depthFrom && d <= view.depthTo;
-      css += on ? `.d${d}{border-color:${borderColor(d, view, data.dark)}}\n`
+      css += on ? `.d${d}{border-color:${borderColor(d, view, dark)}}\n`
         : `.d${d}{border-color:transparent}.b.d${d}{pointer-events:none}\n`;
     }
     return css;
@@ -652,7 +669,8 @@ ${data.items.join('\n')}
   const PANEL_CSS = `:host{all:initial}
 .p{position:fixed;top:12px;right:12px;width:268px;z-index:2147483647;background:rgba(15,18,25,.94);color:#e5e7eb;
   font:12px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;border:1px solid rgba(255,255,255,.08);border-radius:12px;
-  box-shadow:0 12px 32px rgba(0,0,0,.45);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);user-select:none}
+  box-shadow:0 12px 32px rgba(0,0,0,.45);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);user-select:none;
+  max-height:calc(100vh - 24px);overflow:auto;scrollbar-width:thin}
 .h{display:flex;align-items:center;gap:4px;padding:9px 10px 9px 12px;cursor:move;border-bottom:1px solid rgba(255,255,255,.06)}
 .h b{flex:1;font-weight:600;font-size:13px;letter-spacing:.01em}
 .x{background:none;border:0;color:#9ca3af;cursor:pointer;font:14px system-ui,sans-serif;width:24px;height:22px;border-radius:6px}
@@ -688,6 +706,10 @@ input[type=color]{width:26px;height:18px;border:1px solid rgba(255,255,255,.15);
     <div class="row"><div class="lab"><span>Рамки</span><input type="color" id="color" title="Свой цвет"></div>
       <div class="seg" id="theme"><button data-v="soft">Мягкие</button><button data-v="mono">Свой цвет</button><button data-v="vivid">Яркие</button></div></div>
     <div class="row"><div class="lab"><span>Яркость рамок</span><span class="v" id="vo"></span></div><input type="range" id="opacity" min="5" max="100" step="1"></div>
+    <div class="row"><div class="lab"><span>Фон</span><input type="color" id="bgcolor" title="Свой цвет фона"></div>
+      <div class="seg" id="bg"><button data-v="page">Сайт</button><button data-v="dark">Тёмный</button><button data-v="light">Светлый</button><button data-v="custom">Свой</button></div></div>
+    <div class="row"><div class="lab"><span>Цвет текста</span></div>
+      <div class="seg" id="tmode"><button data-v="original">Как на сайте</button><button data-v="contrast">Контрастный</button></div></div>
     <div class="chk">
       <label><input type="checkbox" id="text">Текст</label><label><input type="checkbox" id="fills">Заливка</label>
       <label><input type="checkbox" id="margins">Отступы</label><label><input type="checkbox" id="padding">Поля</label>
@@ -701,6 +723,13 @@ input[type=color]{width:26px;height:18px;border:1px solid rgba(255,255,255,.15);
 </div>`;
 
   let panel = null;
+
+  function toHex(c) {
+    if (/^#[\da-f]{6}$/i.test(c)) return c;
+    const m = /rgba?\(([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)/.exec(c || '');
+    if (!m) return '#ffffff';
+    return '#' + [m[1], m[2], m[3]].map((v) => Math.round(+v).toString(16).padStart(2, '0')).join('');
+  }
 
   async function open(userOpts = {}) {
     if (panel) return panel.api;
@@ -732,6 +761,10 @@ input[type=color]{width:26px;height:18px;border:1px solid rgba(255,255,255,.15);
       $('color').value = view.color;
       ['text', 'fills', 'margins', 'padding', 'overlay'].forEach((k) => { $(k).checked = !!view[k]; });
       root.querySelectorAll('#theme button').forEach((b) => b.classList.toggle('on', b.dataset.v === view.theme));
+      const bgKind = view.background === 'page' || view.background === 'dark' || view.background === 'light' ? view.background : 'custom';
+      root.querySelectorAll('#bg button').forEach((b) => b.classList.toggle('on', b.dataset.v === bgKind));
+      root.querySelectorAll('#tmode button').forEach((b) => b.classList.toggle('on', b.dataset.v === view.textMode));
+      $('bgcolor').value = toHex(effectiveBg(data, view));
       root.querySelectorAll('#scope button').forEach((b) => b.classList.toggle('on', (b.dataset.v === 'page') === !!opts.fullPage));
       root.querySelectorAll('#media button').forEach((b) => b.classList.toggle('on', b.dataset.v === opts.media));
     }
@@ -759,6 +792,14 @@ input[type=color]{width:26px;height:18px;border:1px solid rgba(255,255,255,.15);
     $('opacity').addEventListener('input', (e) => { view.opacity = +e.target.value / 100; refreshView(); });
     $('color').addEventListener('input', (e) => { view.color = e.target.value; view.theme = 'mono'; refreshView(); });
     ['text', 'fills', 'margins', 'padding', 'overlay'].forEach((k) => $(k).addEventListener('change', (e) => { view[k] = e.target.checked; refreshView(); }));
+    $('bg').addEventListener('click', (e) => {
+      const v = e.target.dataset && e.target.dataset.v;
+      if (!v) return;
+      view.background = v === 'custom' ? $('bgcolor').value : v;
+      refreshView();
+    });
+    $('bgcolor').addEventListener('input', (e) => { view.background = e.target.value; refreshView(); });
+    $('tmode').addEventListener('click', (e) => { const v = e.target.dataset && e.target.dataset.v; if (v) { view.textMode = v; refreshView(); } });
     $('theme').addEventListener('click', (e) => { const v = e.target.dataset && e.target.dataset.v; if (v) { view.theme = v; refreshView(); } });
     $('scope').addEventListener('click', (e) => { const v = e.target.dataset && e.target.dataset.v; if (v && (v === 'page') !== !!opts.fullPage) { opts.fullPage = v === 'page'; capture(); } });
     $('media').addEventListener('click', (e) => { const v = e.target.dataset && e.target.dataset.v; if (v && v !== opts.media) { opts.media = v; capture(); } });
