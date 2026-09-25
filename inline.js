@@ -1,27 +1,37 @@
 /*!
- * inline.js v8 — точный скриншот страницы или элемента.
- *
- * Два движка:
- *   • Пиксели вкладки (по умолчанию) — как «Capture node screenshot» в DevTools: берёт готовое
- *     изображение вкладки (getDisplayMedia) и вырезает экран, элемент или всю страницу
- *     (склейкой при прокрутке). Видит всё: картинки с любых сайтов, чужие iframe, видео,
- *     WebGL, закрытый Shadow DOM. Браузер спросит разрешение — выберите эту вкладку.
- *   • DOM-рендер (если разрешения нет) — копия страницы с вычисленными стилями, встроенными
- *     картинками и шрифтами, через SVG <foreignObject>; раскладка сверяется с оригиналом.
+ * inline.js v9 — скриншот страницы или элемента без разрешений браузера.
+ * Копирует DOM (включая Shadow DOM и same-origin iframe) с вычисленными стилями,
+ * встраивает картинки, шрифты и фоны, рисует через SVG <foreignObject> в <canvas>
+ * и сохраняет PNG. Раскладка копии сверяется с оригиналом — элементы стоят на своих местах.
  *
  * Использование:
  *   1) Вставить в консоль — сразу скачает скриншот того, что видно на экране.
  *   2) <script src="inline.js" data-manual></script>, затем:
- *        await htmlShot.download();                               // видимая область
- *        await htmlShot.download({ fullPage: true });             // вся страница целиком
- *        await htmlShot.download({ target: document.querySelector('#app') });  // элемент
- *        const canvas = await htmlShot.captureNode('#chart');     // элемент → canvas
+ *        await htmlShot.download();                                   // видимая область
+ *        await htmlShot.download({ fullPage: true });                 // вся страница
+ *        await htmlShot.download({ target: document.querySelector('#app') });
+ *        const canvas = await htmlShot.capture({ preset: 'fast' });
  *        const blob   = await htmlShot.toBlob({ type: 'image/jpeg', quality: 0.9 });
- *   Настройки до вставки в консоль: window.HTML_SHOT_CONFIG = { fullPage: true, ... }
- *     method: 'auto' | 'pixel' | 'dom'   — 'dom' снимает без разрешений браузера
- *     keepStream: true                   — спросить разрешение один раз на несколько снимков
- *                                          (закрыть захват: htmlShot.stop())
- *   Элементы с атрибутом data-html-shot-ignore не попадают в DOM-снимок.
+ *   Настройки до вставки в консоль: window.HTML_SHOT_CONFIG = { preset: 'fast', maxDepth: 25 }
+ *
+ * Скорость ↔ точность:
+ *   preset: 'fast'       — быстро: 1x, без шрифтов сайта, без iframe, 1 проход сверки, глубина ≤ 40
+ *           'balanced'   — по умолчанию
+ *           'best'       — максимум: 2x и больше, больше проходов сверки
+ *   Любой ключ можно задать отдельно, он важнее пресета:
+ *     maxDepth, maxElements — сколько вложенности/элементов копировать (глубже — только фон и рамка)
+ *     scale                 — чёткость (1 — быстрее всего)
+ *     embedFonts, jsFonts   — шрифты сайта (без них текст запасным шрифтом, но быстро)
+ *     images                — картинки и CSS-фоны (false — без загрузок)
+ *     pseudoElements        — ::before/::after (иконки-шрифты, декор)
+ *     iframes, shadowDom, svgSprites — содержимое фреймов, веб-компонентов, SVG-спрайтов
+ *     lockLayout, lockPasses — сверка раскладки с оригиналом и число её проходов
+ *     cullOffscreen         — не копировать скрытое за краем прокручиваемых блоков
+ *     lazyImages, freezeAnimations, contentVisibility — подготовка страницы перед снимком
+ *     concurrency, timeout  — параллельные загрузки и таймаут одной загрузки
+ *     frameBudget           — мс работы подряд перед паузой (больше — быстрее, но страница «подвисает»)
+ *   htmlShot.lastReport.elements — сколько элементов скопировано в последний снимок.
+ *   Элементы с атрибутом data-html-shot-ignore не попадают в скриншот.
  */
 (function (global) {
   'use strict';
@@ -51,12 +61,37 @@
     contentVisibility: true,  // раскрыть content-visibility:auto на время снимка
     jsFonts: true,            // встраивать шрифты, добавленные через FontFace API
     fallbackHtml2canvas: true,// если SVG-рендер не удался и на странице есть window.html2canvas
-    method: 'auto',           // 'auto' — пиксели вкладки (как «Capture node screenshot» в DevTools),
-                              //   а если браузер не дал разрешения — DOM-рендер; 'pixel' — только пиксели; 'dom' — без разрешений
-    keepStream: false,        // не закрывать захват вкладки между снимками: разрешение спросят один раз (htmlShot.stop())
     lockLayout: true,         // сверить копию с оригиналом и поставить съехавшие элементы на место
     ui: true,                 // всплывающие уведомления при download()
+
+    // ---- Скорость ↔ точность (всё, что влияет на время снимка) ----
+    preset: 'balanced',       // 'fast' | 'balanced' | 'best' — набор настроек ниже; свои ключи важнее пресета
+    maxDepth: Infinity,       // глубина вложенности: глубже — только «коробка» элемента (фон, рамка), без содержимого
+    maxElements: Infinity,    // сколько элементов копировать; дальше — только «коробки»
+    lockPasses: 6,            // проходов сверки раскладки (1 — быстро, 6 — точно)
+    pseudoElements: true,     // ::before / ::after (иконки-шрифты, декор): +2 расчёта стиля на элемент
+    iframes: true,            // содержимое same-origin iframe (иначе серый прямоугольник)
+    shadowDom: true,          // содержимое веб-компонентов (Shadow DOM)
+    images: true,             // встраивать картинки и CSS-фоны (false — без загрузок, пустые места)
+    svgSprites: true,         // SVG-спрайты <use href="#id"> и внешние sprite.svg
+    cullOffscreen: true,      // не копировать содержимое, скрытое за краем прокручиваемых блоков
   };
+
+  // Пресеты. fast — в разы быстрее на тяжёлых страницах, но без шрифтов сайта, в 1x и
+  // с упрощённой сверкой; best — максимум чёткости и точности.
+  const PRESETS = {
+    fast: {
+      scale: 1, embedFonts: false, jsFonts: false, lockPasses: 1, lazyImages: false,
+      freezeAnimations: false, iframes: false, maxDepth: 40, frameBudget: 40, concurrency: 12, timeout: 5000,
+    },
+    balanced: {},
+    best: { scale: Math.max(2, global.devicePixelRatio || 1), lockPasses: 8, timeout: 30000 },
+  };
+
+  function resolveOptions(userOpts = {}) {
+    const preset = PRESETS[userOpts.preset || DEFAULTS.preset] || {};
+    return Object.assign({}, DEFAULTS, preset, userOpts);
+  }
 
   const SKIP_TAGS = new Set(['script', 'style', 'noscript', 'template', 'link', 'meta', 'head', 'title', 'base', 'object', 'embed', 'track']);
   const NO_CHILDREN = new Set(['img', 'canvas', 'video', 'audio', 'iframe', 'input', 'textarea']);
@@ -280,7 +315,7 @@
   function setStyle(el, style, base, ctx) {
     if (!style) return;
     el.setAttribute('style', style);
-    if (style.includes('url(')) {
+    if (ctx.opts.images && style.includes('url(')) {
       ctx.tasks.push(inlineUrls(style, base, ctx).then((s) => el.setAttribute('style', s)));
     }
   }
@@ -457,8 +492,8 @@
 
   /* ---------------- клонирование DOM ---------------- */
 
-  function childNodesOf(node) {
-    if (node.shadowRoot) return Array.from(node.shadowRoot.childNodes);
+  function childNodesOf(node, opts) {
+    if (node.shadowRoot && opts.shadowDom) return Array.from(node.shadowRoot.childNodes);
     if (node.localName === 'slot' && node.assignedNodes) {
       const assigned = node.assignedNodes({ flatten: true });
       if (assigned.length) return assigned;
@@ -632,10 +667,12 @@
     }
     setStyle(el, style, doc.baseURI, ctx);
 
-    if (culled) return el;
+    // Лимиты глубины и количества: дальше копируем только «коробку» — раскладка не едет
+    ctx.count++;
+    if (culled || (flags.depth || 0) >= ctx.opts.maxDepth || ctx.count > ctx.opts.maxElements) return el;
 
     // Псевдоэлементы ::before / ::after
-    if (isHTML && !NO_CHILDREN.has(tag)) {
+    if (ctx.opts.pseudoElements && isHTML && !NO_CHILDREN.has(tag)) {
       for (const pseudo of ['::before', '::after']) {
         const pcs = win.getComputedStyle(node, pseudo);
         const content = pcs.content;
@@ -646,7 +683,7 @@
         addFonts(pcs.fontFamily, ctx);
         addChars(content, ctx);
         const slot = ctx.pseudo.push(rule) - 1;
-        if (rule.includes('url(')) ctx.tasks.push(inlineUrls(rule, doc.baseURI, ctx).then((r) => { ctx.pseudo[slot] = r; }));
+        if (ctx.opts.images && rule.includes('url(')) ctx.tasks.push(inlineUrls(rule, doc.baseURI, ctx).then((r) => { ctx.pseudo[slot] = r; }));
       }
     }
 
@@ -654,7 +691,7 @@
     if (isHTML) {
       if (tag === 'img') {
         el.setAttribute('src', ctx.opts.placeholder);
-        ctx.tasks.push(imageSource(node, ctx).then((s) => el.setAttribute('src', s)));
+        if (ctx.opts.images) ctx.tasks.push(imageSource(node, ctx).then((s) => el.setAttribute('src', s)));
       } else if (tag === 'canvas') {
         let data = null;
         try { data = node.toDataURL(); } catch (_) { ctx.taintedCanvases++; }
@@ -662,12 +699,12 @@
       } else if (tag === 'video') {
         const frame = node.readyState >= 2 && node.videoWidth ? drawToDataURL(node, node.videoWidth, node.videoHeight) : null;
         el.setAttribute('src', frame || ctx.opts.placeholder);
-        if (!frame && node.poster) {
+        if (!frame && node.poster && ctx.opts.images) {
           ctx.tasks.push(toDataURL(node.poster, ctx.opts).then((d) => { if (looksLikeImage(d)) el.setAttribute('src', d); }));
         }
       } else if (tag === 'iframe') {
         let fdoc = null;
-        try { fdoc = node.contentDocument; } catch (_) {}
+        if (ctx.opts.iframes) try { fdoc = node.contentDocument; } catch (_) {}
         if (fdoc && fdoc.documentElement) {
           const fwin = fdoc.defaultView;
           // Окно фрейма: absolute/fixed внутри iframe отсчитываются от его угла, а не от угла
@@ -680,7 +717,7 @@
             'margin:0;padding:0;border:0;overflow:hidden;contain:strict;');
           el.appendChild(view);
           const inner = await cloneNode(fdoc.documentElement, ctx, null, { x: fwin.scrollX, y: fwin.scrollY }, {
-            isRoot: true, isFrameRoot: true,
+            isRoot: true, isFrameRoot: true, depth: (flags.depth || 0) + 1,
             pIdx: pairIdx >= 0 ? pairIdx : flags.pIdx, warped: !!flags.warped || warps,
             frame: { el: node, parent: flags.frame || null },
           });
@@ -709,11 +746,11 @@
       }
     } else if (ns === SVGNS) {
       const href = node.getAttribute('href') || node.getAttributeNS(XLINK, 'href');
-      if (tag === 'image' && href) {
+      if (tag === 'image' && href && ctx.opts.images) {
         ctx.tasks.push(toDataURL(href, ctx.opts).then((d) => {
           if (d) { el.removeAttributeNS(XLINK, 'href'); el.setAttribute('href', d); }
         }));
-      } else if (tag === 'use' && href) {
+      } else if (tag === 'use' && href && ctx.opts.svgSprites) {
         if (href.startsWith('#')) ctx.refIds.add(href.slice(1));
         else if (href.includes('#')) {
           ctx.tasks.push(externalSymbol(href, ctx).then((id) => {
@@ -729,14 +766,15 @@
         ? { x: node.scrollLeft, y: node.scrollTop } : null;
       // Потомки absolute/fixed могут быть видны за пределами обрезающего предка
       let childClip = cs.position === 'absolute' || cs.position === 'fixed' ? null : clip;
-      if (isHTML && !isDocRoot && (cs.overflowX !== 'visible' || cs.overflowY !== 'visible') && cs.display !== 'contents') {
+      if (ctx.opts.cullOffscreen && isHTML && !isDocRoot && (cs.overflowX !== 'visible' || cs.overflowY !== 'visible') && cs.display !== 'contents') {
         childClip = clipTo(rect || node.getBoundingClientRect(), clip);
       }
       const d = cs.display;
       const dropBelow = isHTML && (d === 'block' || d === 'flow-root' || d === 'list-item' ||
         (d === 'flex' && cs.flexDirection === 'column' && /^(normal|flex-start|start)$/.test(cs.justifyContent)));
-      const childFlags = { dropBelow, pIdx: pairIdx >= 0 ? pairIdx : flags.pIdx, warped: !!flags.warped || warps, frame: flags.frame };
-      for (const k of childNodesOf(node)) {
+      const childFlags = { dropBelow, pIdx: pairIdx >= 0 ? pairIdx : flags.pIdx, warped: !!flags.warped || warps,
+        frame: flags.frame, depth: (flags.depth || 0) + 1 };
+      for (const k of childNodesOf(node, ctx.opts)) {
         const c = await cloneNode(k, ctx, vals, scrolled, childFlags, childClip);
         if (c) el.appendChild(c);
       }
@@ -792,7 +830,7 @@
       fonts: new Set(), fontStrings: new Set(), chars: new Set(),
       pseudo: [], tasks: [], refIds: new Set(), extraDefs: [], extraIds: new Set(),
       sprites: new Map(), uid: 0, viewportFix: null, height: 0, lastYield: performance.now(),
-      missingFonts: new Set(), taintedCanvases: 0, moved: 0,
+      missingFonts: new Set(), taintedCanvases: 0, moved: 0, count: 0,
       pairs: withPairs ? [] : null,
     };
 
@@ -816,10 +854,10 @@
     ctx.height = height;
 
     let rootClip = null;
-    if (isDoc && !opts.fullPage) rootClip = { left: 0, top: 0, right: width, bottom: height };
+    if (isDoc && !opts.fullPage && opts.cullOffscreen) rootClip = { left: 0, top: 0, right: width, bottom: height };
     const root = await cloneNode(target, ctx, null, rootOffset, { isRoot: true }, rootClip);
     await Promise.all(ctx.tasks);   // картинки/фоны грузились параллельно с обходом
-    ensureRefs(root, ctx);
+    if (opts.svgSprites) ensureRefs(root, ctx);
 
     let css = ctx.pseudo.join('\n');
     if (opts.embedFonts) css = (await collectFontCSS(ctx)) + '\n' + css;
@@ -941,10 +979,10 @@
   // документа: сдвиг родителя уже учтён, дочерний элемент двигаем только на остаток.
   // Если родитель стал position:relative, его потомков проверяем на следующем проходе,
   // после новой раскладки. Возвращает число поправленных элементов.
-  function alignToOriginal(pairs, expected) {
+  function alignToOriginal(pairs, expected, maxPasses = 6) {
     const ZERO = { x: 0, y: 0 };
     let moved = 0;
-    for (let pass = 0; pass < 6; pass++) {
+    for (let pass = 0; pass < Math.max(1, maxPasses | 0); pass++) {
       const actual = pairs.map((pair) => pair.el.getBoundingClientRect()); // одна раскладка на проход
       const shift = new Array(pairs.length); // null — «пересчитать на следующем проходе»
       let movedNow = 0;
@@ -1071,7 +1109,7 @@
       let frame = null;
       try {
         ({ frame } = await layoutInFrame(root, width, height, opts));
-        ctx.moved = alignToOriginal(ctx.pairs, expected);
+        ctx.moved = alignToOriginal(ctx.pairs, expected, opts.lockPasses);
         await breathe(ctx);
         xml = new XMLSerializer().serializeToString(root);
       } catch (_) {
@@ -1093,7 +1131,7 @@
     } catch (e) {
       if (e.name === 'SecurityError') {
         throw new Error('[htmlShot] Браузер запретил читать SVG-снимок (так делает Safari). ' +
-          'Помогут захват вкладки (htmlShot.captureTab) или html2canvas на странице.');
+          'Поможет html2canvas на странице.');
       }
       throw e;
     }
@@ -1121,9 +1159,9 @@
     return global.html2canvas(target, h2cOpts);
   }
 
-  // Снимок без разрешений: копия DOM → SVG → canvas
-  async function captureDom(userOpts = {}) {
-    const opts = Object.assign({}, DEFAULTS, userOpts);
+  // Копия DOM → SVG → canvas
+  async function capture(userOpts = {}) {
+    const opts = resolveOptions(userOpts);
     concurrency = Math.max(1, opts.concurrency | 0 || 6);
     failed.clear();
     const restore = await preparePage(opts);
@@ -1144,6 +1182,8 @@
       missingFonts: ctx ? [...ctx.missingFonts] : [],
       taintedCanvases: ctx ? ctx.taintedCanvases : 0,
       moved: ctx ? ctx.moved : 0,   // сколько элементов копии поправила сверка раскладки
+      elements: ctx ? ctx.count : 0, // сколько элементов скопировано
+      preset: opts.preset,
     };
     if (engine === 'html2canvas' && canvas.h2cFailed) {
       canvas.h2cFailed.forEach((url) => report.failed.push({ url, kind: 'image' }));
@@ -1152,20 +1192,6 @@
     canvas.htmlShotReport = report;
     api.lastReport = report;
     return canvas;
-  }
-
-  // Главный вход: пиксели вкладки, а если их не дали (method: 'auto') — DOM-рендер
-  async function capture(userOpts = {}) {
-    const opts = Object.assign({}, DEFAULTS, userOpts);
-    if (opts.method === 'dom' || (opts.method === 'auto' && !pixelSupported())) return captureDom(opts);
-    try {
-      return await capturePixels(opts);
-    } catch (err) {
-      if (opts.method !== 'auto') throw err;
-      const canvas = await captureDom(opts);
-      canvas.htmlShotReport.pixelError = err && err.name;
-      return canvas;
-    }
   }
 
   function canvasToBlob(canvas, opts) {
@@ -1177,12 +1203,12 @@
   }
 
   async function toBlob(userOpts = {}) {
-    const opts = Object.assign({}, DEFAULTS, userOpts);
+    const opts = resolveOptions(userOpts);
     return canvasToBlob(await capture(opts), opts);
   }
 
   async function toDataURLApi(userOpts = {}) {
-    const opts = Object.assign({}, DEFAULTS, userOpts);
+    const opts = resolveOptions(userOpts);
     return (await capture(opts)).toDataURL(opts.type, opts.quality);
   }
 
@@ -1260,288 +1286,36 @@
     return parts.join(';\n');
   }
 
-  function errorText(err) {
-    if (err && err.name === 'NotAllowedError') return 'Захват вкладки отменён.';
-    return (err && err.message) || String(err);
-  }
-
-  async function saveCanvas(canvas, opts, t0) {
-    const blob = await canvasToBlob(canvas, opts);
-    const name = opts.filename || autoFilename(opts.type);
-    saveBlob(blob, name);
-    const report = canvas.htmlShotReport;
-    if (opts.ui) {
-      const head = `✅ Сохранено: ${name}\n${Math.round(blob.size / 1024)} КБ, ${((performance.now() - t0) / 1000).toFixed(1)} с` +
-        (report.engine === 'pixel' ? '' : report.engine === 'svg' ? ' (DOM)' : ` (${report.engine})`);
-      if (report.problems && pixelSupported()) {
-        offerPixel(head + '\n⚠️ ' + describeProblems(report) + '.\nТочный снимок (пиксели вкладки) видит всё.', 'warn', opts);
-      } else if (report.problems) {
-        toast(head + '\n⚠️ ' + describeProblems(report) + '.', 'warn', null, 8000);
-      } else {
-        toast(head, 'ok', null, 4000);
-      }
-    }
-    return blob;
-  }
-
-  async function downloadPixel(opts) {
-    const t0 = performance.now();
-    return saveCanvas(await capturePixels(opts), opts, t0);
-  }
-
-  async function downloadDom(opts) {
+  async function download(userOpts = {}) {
+    const opts = resolveOptions(userOpts);
     const t0 = performance.now();
     if (opts.ui) toast('📸 Снимаю ' + (opts.target ? 'элемент' : opts.fullPage ? 'страницу' : 'видимую область') + '…');
-    return saveCanvas(await captureDom(opts), opts, t0);
-  }
-
-  function offerPixel(text, kind, opts) {
-    toast(text, kind, [
-      { label: '📸 Снять точно', onClick: () => downloadPixel(opts).catch((e) => toast('❌ ' + errorText(e), 'error', null, 8000)) },
-      { label: 'Закрыть', secondary: true, onClick: removeToast },
-    ], 20000);
-  }
-
-  async function download(userOpts = {}) {
-    const opts = Object.assign({}, DEFAULTS, userOpts);
     try {
-      if (opts.method === 'dom' || (opts.method === 'auto' && !pixelSupported())) return await downloadDom(opts);
-      try {
-        return await downloadPixel(opts);
-      } catch (err) {
-        // Захват вкладки браузер разрешает только по клику (из консоли DevTools клик не нужен)
-        if (err && err.name === 'InvalidStateError' && opts.ui) {
-          return await new Promise((resolve, reject) => toast('Для точного снимка браузеру нужен клик.', 'info', [
-            { label: '📸 Снять точно', onClick: () => downloadPixel(opts).then(resolve, (e) =>
-              (opts.method === 'auto' ? downloadDom(opts) : Promise.reject(e)).then(resolve, reject)) },
-            { label: 'Без разрешения', secondary: true, onClick: () => downloadDom(opts).then(resolve, reject) },
-          ]));
-        }
-        if (opts.method !== 'auto') throw err;
-        return await downloadDom(opts); // отказались, выбрали не ту вкладку, браузер не умеет
+      const canvas = await capture(opts);
+      const blob = await canvasToBlob(canvas, opts);
+      const name = opts.filename || autoFilename(opts.type);
+      saveBlob(blob, name);
+      if (opts.ui) {
+        const report = canvas.htmlShotReport;
+        const head = `✅ Сохранено: ${name}\n${Math.round(blob.size / 1024)} КБ, ${((performance.now() - t0) / 1000).toFixed(1)} с` +
+          (report.engine === 'svg' ? '' : ` (${report.engine})`);
+        if (report.problems) toast(head + '\n⚠️ ' + describeProblems(report) + '.', 'warn', null, 8000);
+        else toast(head, 'ok', null, 4000);
       }
+      return blob;
     } catch (err) {
-      if (opts.ui) toast('❌ Не удалось сделать скриншот:\n' + errorText(err), 'error', [{ label: 'Закрыть', secondary: true, onClick: removeToast }], 10000);
+      if (opts.ui) toast('❌ Не удалось сделать скриншот:\n' + ((err && err.message) || err), 'error', [{ label: 'Закрыть', secondary: true, onClick: removeToast }], 10000);
       throw err;
     }
   }
 
-  /* ---------------- пиксельный захват: как «Capture node screenshot» в DevTools ---------------- */
-  // Берёт готовые пиксели вкладки (getDisplayMedia) и вырезает нужное: экран, элемент или
-  // всю страницу (склейкой при прокрутке). Видно всё, что видит пользователь: картинки с
-  // любых сайтов, чужие iframe, видео, WebGL, закрытый Shadow DOM. Нужно разрешение браузера.
-
-  let live = null; // { stream, track, video } — открытый захват вкладки
-
-  function pixelSupported() {
-    const md = navigator.mediaDevices;
-    return !!(md && md.getDisplayMedia) && global.isSecureContext !== false;
-  }
-
-  function namedError(name, message) {
-    const e = new Error(message);
-    e.name = name;
-    return e;
-  }
-
-  function stop() {
-    if (live) { live.stream.getTracks().forEach((t) => t.stop()); live = null; }
-  }
-
-  async function openStream() {
-    if (live && live.track.readyState === 'live') return live;
-    live = null;
-    if (!pixelSupported()) throw namedError('NotSupportedError', 'Браузер не умеет захватывать вкладку (нужен Chrome/Edge/Firefox по https).');
-    const dpr = global.devicePixelRatio || 1;
-    const stream = await navigator.mediaDevices.getDisplayMedia({
-      video: {
-        displaySurface: 'browser', frameRate: { ideal: 30 },
-        width: { ideal: Math.round(screen.width * dpr) }, height: { ideal: Math.round(screen.height * dpr) },
-      },
-      audio: false, preferCurrentTab: true, selfBrowserSurface: 'include', surfaceSwitching: 'exclude', monitorTypeSurfaces: 'exclude',
-    });
-    const track = stream.getVideoTracks()[0];
-    const video = document.createElement('video');
-    video.muted = true; video.playsInline = true; video.srcObject = stream;
-    try {
-      await video.play();
-      for (let i = 0; i < 60 && !video.videoWidth; i++) await sleep(50);
-      // Панель «идёт демонстрация» уменьшает окно не сразу — ждём, пока кадр и окно совпадут
-      const settings = track.getSettings ? track.getSettings() : {};
-      const matches = () => {
-        const vw = global.innerWidth, vh = global.innerHeight;
-        return video.videoWidth && Math.abs(vw / vh - video.videoWidth / video.videoHeight) / (vw / vh) < 0.02;
-      };
-      let ok = false;
-      for (let i = 0; i < 25 && !(ok = matches()); i++) await sleep(100);
-      if (!ok || (settings.displaySurface && settings.displaySurface !== 'browser')) {
-        throw namedError('WrongSurfaceError', 'Выбрана не эта вкладка. Запустите снова и выберите текущую вкладку.');
-      }
-      await sleep(150);
-    } catch (e) {
-      stream.getTracks().forEach((t) => t.stop());
-      throw e;
-    }
-    live = { stream, track, video };
-    track.addEventListener('ended', () => { if (live && live.track === track) live = null; });
-    return live;
-  }
-
-  function waitVideoFrame(video) {
-    return new Promise((resolve) => {
-      if (!video.requestVideoFrameCallback) return setTimeout(resolve, 150);
-      let done = false;
-      video.requestVideoFrameCallback(() => { done = true; resolve(); });
-      setTimeout(() => { if (!done) resolve(); }, 600);
-    });
-  }
-
-  // Свежий кадр: после прокрутки/скрытия уведомления вкладка должна перерисоваться
-  async function grabFrame(video) {
-    await twoFrames();
-    await sleep(120);
-    await waitVideoFrame(video);
-    await waitVideoFrame(video);
-    const c = document.createElement('canvas');
-    c.width = video.videoWidth; c.height = video.videoHeight;
-    c.getContext('2d').drawImage(video, 0, 0);
-    return c;
-  }
-
-  // При склейке фиксированные/липкие элементы остаются только на первом кадре.
-  // Предков снимаемого элемента не прячем — иначе спрячется и он сам.
-  function hideFixedElements(keep) {
-    const hidden = [];
-    for (const el of document.querySelectorAll('body *')) {
-      if (el.hasAttribute(TOAST) || (keep && el.contains(keep))) continue;
-      const pos = getComputedStyle(el).position;
-      if (pos === 'fixed' || pos === 'sticky') {
-        hidden.push([el, el.style.getPropertyValue('visibility'), el.style.getPropertyPriority('visibility')]);
-        el.style.setProperty('visibility', 'hidden', 'important');
-      }
-    }
-    return () => hidden.forEach(([el, v, p]) => (v ? el.style.setProperty('visibility', v, p) : el.style.removeProperty('visibility')));
-  }
-
-  function scrollToXY(x, y) {
-    try { global.scrollTo({ left: x, top: y, behavior: 'instant' }); } catch (_) { global.scrollTo(x, y); }
-  }
-
-  // Запоминает прокрутку всех прокручиваемых предков элемента, чтобы вернуть её после снимка
-  function rememberScroll(el) {
-    const saved = [];
-    for (let n = el.parentElement; n; n = n.parentElement) {
-      if (n.scrollTop || n.scrollLeft || n.scrollHeight > n.clientHeight || n.scrollWidth > n.clientWidth) {
-        saved.push([n, n.scrollLeft, n.scrollTop]);
-      }
-    }
-    const wx = global.scrollX, wy = global.scrollY;
-    return () => {
-      saved.forEach(([n, x, y]) => { n.scrollLeft = x; n.scrollTop = y; });
-      scrollToXY(wx, wy);
-    };
-  }
-
-  function pixelReport(canvas) {
-    const report = { engine: 'pixel', failed: [], missingFonts: [], taintedCanvases: 0, moved: 0, problems: 0 };
-    canvas.htmlShotReport = report;
-    api.lastReport = report;
-    return canvas;
-  }
-
-  async function capturePixels(userOpts = {}) {
-    const opts = Object.assign({}, DEFAULTS, userOpts);
-    const target = opts.target && opts.target !== document.documentElement && opts.target !== document.body ? opts.target : null;
-    const s = await openStream();
-    const restoreScroll = target ? rememberScroll(target) : (() => { const x = global.scrollX, y = global.scrollY; return () => scrollToXY(x, y); })();
-    let restoreFixed = () => {};
-    removeToast();
-    try {
-      const video = s.video;
-      const kx = () => video.videoWidth / global.innerWidth, ky = () => video.videoHeight / global.innerHeight;
-
-      // 1) Только экран — кадр целиком, ровно то, что видит пользователь
-      if (!target && !opts.fullPage) return pixelReport(await grabFrame(video));
-
-      const vp = viewportSize(); // без полос прокрутки
-      // 2) Элемент помещается в окно — докручиваем до него (и внутри прокручиваемых блоков) и вырезаем
-      if (target) {
-        let r = target.getBoundingClientRect();
-        if (r.width <= vp.width && r.height <= vp.height) {
-          if (r.left < 0 || r.top < 0 || r.right > vp.width || r.bottom > vp.height) {
-            target.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'instant' });
-            await twoFrames();
-            r = target.getBoundingClientRect();
-          }
-          const frame = await grabFrame(video);
-          const x0 = Math.max(0, Math.floor(r.left)), y0 = Math.max(0, Math.floor(r.top));
-          const w = Math.max(1, Math.min(vp.width, Math.ceil(r.right)) - x0), h = Math.max(1, Math.min(vp.height, Math.ceil(r.bottom)) - y0);
-          const out = document.createElement('canvas');
-          out.width = Math.round(w * kx()); out.height = Math.round(h * ky());
-          out.getContext('2d').drawImage(frame, x0 * kx(), y0 * ky(), out.width, out.height, 0, 0, out.width, out.height);
-          return pixelReport(out);
-        }
-      }
-
-      // 3) Больше окна (вся страница или крупный элемент) — склейка кадров при прокрутке окна
-      const de = document.documentElement;
-      let region;
-      if (target) {
-        const r = target.getBoundingClientRect();
-        const x = Math.floor(r.left + global.scrollX), y = Math.floor(r.top + global.scrollY);
-        region = { x, y, w: Math.ceil(r.right + global.scrollX) - x, h: Math.ceil(r.bottom + global.scrollY) - y };
-      } else {
-        region = {
-          x: 0, y: 0,
-          w: Math.max(de.scrollWidth, document.body ? document.body.scrollWidth : 0, vp.width),
-          h: Math.max(de.scrollHeight, document.body ? document.body.scrollHeight : 0, vp.height),
-        };
-      }
-      let W = Math.round(region.w * kx()), H = Math.round(region.h * ky());
-      if (W > 32767) { W = 32767; region.w = Math.floor(W / kx()); }
-      const maxH = Math.floor(Math.min(32767, 268435456 / W));
-      if (H > maxH) { H = maxH; region.h = Math.floor(H / ky()); } // лимит размера canvas
-      const out = document.createElement('canvas');
-      out.width = W; out.height = H;
-      const c2d = out.getContext('2d');
-      let tiles = 0;
-      for (let ty = region.y; ty < region.y + region.h; ty += vp.height) {
-        for (let tx = region.x; tx < region.x + region.w; tx += vp.width) {
-          const bw = Math.min(vp.width, region.x + region.w - tx), bh = Math.min(vp.height, region.y + region.h - ty);
-          const inView = tx >= global.scrollX && ty >= global.scrollY &&
-            tx + bw <= global.scrollX + vp.width && ty + bh <= global.scrollY + vp.height;
-          if (!inView) scrollToXY(tx, ty);
-          const frame = await grabFrame(video);
-          const ax = global.scrollX, ay = global.scrollY; // браузер мог упереться в край страницы
-          c2d.drawImage(frame, (tx - ax) * kx(), (ty - ay) * ky(), bw * kx(), bh * ky(),
-            (tx - region.x) * kx(), (ty - region.y) * ky(), bw * kx(), bh * ky());
-          if (++tiles === 1) restoreFixed = hideFixedElements(target);
-          if (tiles > 400) break;
-        }
-      }
-      return pixelReport(out);
-    } finally {
-      restoreFixed();
-      restoreScroll();
-      if (!opts.keepStream) stop();
-    }
-  }
-
-  // Снимок одного элемента по-пиксельно — аналог «Capture node screenshot»
-  function captureNode(el, userOpts = {}) {
-    return capture(Object.assign({}, userOpts, { target: typeof el === 'string' ? document.querySelector(el) : el }));
-  }
-
-  const api = {
-    version: '8.0', capture, captureNode, capturePixels, captureDom, toBlob, toDataURL: toDataURLApi, download,
-    captureTab: capturePixels, stop, defaults: DEFAULTS, lastReport: null,
-  };
+  const api = { version: '9.0', capture, toBlob, toDataURL: toDataURLApi, download, defaults: DEFAULTS, presets: PRESETS, lastReport: null };
   global.htmlShot = api;
 
   // Автозапуск (если вставили в консоль или подключили без data-manual)
   if (!(currentScript && currentScript.hasAttribute('data-manual'))) {
     const run = () => {
-      // Настройки без правки файла: window.HTML_SHOT_CONFIG = { fullPage: true, method: 'dom' }
+      // Настройки без правки файла: window.HTML_SHOT_CONFIG = { preset: 'fast', fullPage: true }
       api.download(global.HTML_SHOT_CONFIG || {})
         .catch(() => { /* ошибка уже показана в уведомлении */ });
     };
