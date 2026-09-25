@@ -18,6 +18,9 @@
  *   await htmlShot.captureTab()  — захват вкладки (видит всё, но спросит разрешение; нужен клик).
  *   htmlShot.lastReport          — что не удалось встроить в последний снимок.
  *
+ * Новое в v7.2: содержимое iframe (например, график TradingView) — absolute/fixed элементы
+ *   внутри фрейма больше не улетают к углу снимка, сверка раскладки работает и внутри фреймов.
+ *
  * Новое в v7.1: по умолчанию снимается только видимая область (fullPage: false), ровно
  *   по размеру окна; страница не прокручивается, содержимое за экраном не трогается.
  *
@@ -596,9 +599,9 @@
     // пришлось бы пересчитывать через матрицу — их не двигаем.
     const warps = cs.transform !== 'none' && !/^matrix\(1, 0, 0, 1, /.test(cs.transform) ||
       (cs.scale || 'none') !== 'none' || (cs.rotate || 'none') !== 'none' || (cs.zoom && cs.zoom !== '1');
-    if (ctx.pairs && doc === document) {
+    if (ctx.pairs) {
       pairIdx = ctx.pairs.push({
-        node, el, parent: flags.pIdx === undefined ? -1 : flags.pIdx, inFixed,
+        node, el, parent: flags.pIdx === undefined ? -1 : flags.pIdx, inFixed, frame: flags.frame || null,
         movable: isHTML && !flags.warped && canTranslate(cloneTag, cs.display),
       }) - 1;
     }
@@ -629,7 +632,7 @@
     }
     // sticky внутри <foreignObject> ведёт себя не так, как на странице (прокрутки там нет):
     // ставим элемент в обычный поток, а на «прилипшее» место его переносит сверка раскладки.
-    if (ctx.pairs && cs.position === 'sticky' && doc === document) {
+    if (ctx.pairs && cs.position === 'sticky') {
       style += 'position:relative;top:auto;right:auto;bottom:auto;left:auto;';
     }
     if (tag === 'textarea') style += 'resize:none;';
@@ -684,8 +687,21 @@
         try { fdoc = node.contentDocument; } catch (_) {}
         if (fdoc && fdoc.documentElement) {
           const fwin = fdoc.defaultView;
-          const inner = await cloneNode(fdoc.documentElement, ctx, null, { x: fwin.scrollX, y: fwin.scrollY }, { isRoot: true, isFrameRoot: true });
-          if (inner) el.appendChild(inner);
+          // Окно фрейма: absolute/fixed внутри iframe отсчитываются от его угла, а не от угла
+          // снимка. contain делает обёртку их «окном» и обрезает всё, что за краем фрейма.
+          const pad = (p) => parseFloat(cs.getPropertyValue(p)) || 0;
+          const vw = Math.max(0, node.clientWidth - pad('padding-left') - pad('padding-right'));
+          const vh = Math.max(0, node.clientHeight - pad('padding-top') - pad('padding-bottom'));
+          const view = ctx.doc.createElementNS(XHTML, 'div');
+          view.setAttribute('style', `display:block;position:relative;width:${vw}px;height:${vh}px;` +
+            'margin:0;padding:0;border:0;overflow:hidden;contain:strict;');
+          el.appendChild(view);
+          const inner = await cloneNode(fdoc.documentElement, ctx, null, { x: fwin.scrollX, y: fwin.scrollY }, {
+            isRoot: true, isFrameRoot: true,
+            pIdx: pairIdx >= 0 ? pairIdx : flags.pIdx, warped: !!flags.warped || warps,
+            frame: { el: node, parent: flags.frame || null },
+          });
+          if (inner) view.appendChild(inner);
           // фон body в iframe заливает всё окно фрейма
           const hb = fwin.getComputedStyle(fdoc.documentElement).backgroundColor;
           const bb = fdoc.body ? fwin.getComputedStyle(fdoc.body).backgroundColor : '';
@@ -736,7 +752,7 @@
       const d = cs.display;
       const dropBelow = isHTML && (d === 'block' || d === 'flow-root' || d === 'list-item' ||
         (d === 'flex' && cs.flexDirection === 'column' && /^(normal|flex-start|start)$/.test(cs.justifyContent)));
-      const childFlags = { dropBelow, inFixed, pIdx: pairIdx >= 0 ? pairIdx : flags.pIdx, warped: !!flags.warped || warps };
+      const childFlags = { dropBelow, inFixed, pIdx: pairIdx >= 0 ? pairIdx : flags.pIdx, warped: !!flags.warped || warps, frame: flags.frame };
       for (const k of childNodesOf(node)) {
         const c = await cloneNode(k, ctx, vals, scrolled, childFlags, childClip);
         if (c) el.appendChild(c);
@@ -851,11 +867,26 @@
   function expectedPositions(pairs, opts, isDoc, target) {
     const tRect = !isDoc ? target.getBoundingClientRect() : null;
     const sx = global.scrollX, sy = global.scrollY;
+    // Угол окна iframe (content-box) в координатах главного окна, с учётом вложенности
+    const origins = new Map();
+    const frameOrigin = (frame) => {
+      if (!frame) return { x: 0, y: 0 };
+      let o = origins.get(frame.el);
+      if (o) return o;
+      const up = frameOrigin(frame.parent);
+      const r = frame.el.getBoundingClientRect();
+      const cs = frame.el.ownerDocument.defaultView.getComputedStyle(frame.el);
+      const n = (p) => parseFloat(cs.getPropertyValue(p)) || 0;
+      o = { x: up.x + r.left + n('border-left-width') + n('padding-left'), y: up.y + r.top + n('border-top-width') + n('padding-top') };
+      origins.set(frame.el, o);
+      return o;
+    };
     return pairs.map((pair) => {
       if (!pair.node.isConnected) return null;
       const r = pair.node.getBoundingClientRect();
       if (!r.width && !r.height) return null;
-      let x = r.left, y = r.top;
+      const fo = frameOrigin(pair.frame);
+      let x = r.left + fo.x, y = r.top + fo.y;
       if (tRect) { x -= tRect.left; y -= tRect.top; }
       else if (opts.fullPage) { x += sx; y += sy; }
       return { x, y, w: r.width, h: r.height };
