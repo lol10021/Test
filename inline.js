@@ -1,20 +1,27 @@
 /*!
- * inline.js v7.4 — скриншот страницы без разрешений браузера.
- * Копирует страницу (включая Shadow DOM и same-origin iframe) с вычисленными стилями,
- * встраивает картинки, шрифты и фоны, рисует через SVG <foreignObject> в <canvas>
- * и сохраняет PNG. Раскладка копии сверяется с оригиналом, элементы стоят на своих местах.
+ * inline.js v8 — точный скриншот страницы или элемента.
+ *
+ * Два движка:
+ *   • Пиксели вкладки (по умолчанию) — как «Capture node screenshot» в DevTools: берёт готовое
+ *     изображение вкладки (getDisplayMedia) и вырезает экран, элемент или всю страницу
+ *     (склейкой при прокрутке). Видит всё: картинки с любых сайтов, чужие iframe, видео,
+ *     WebGL, закрытый Shadow DOM. Браузер спросит разрешение — выберите эту вкладку.
+ *   • DOM-рендер (если разрешения нет) — копия страницы с вычисленными стилями, встроенными
+ *     картинками и шрифтами, через SVG <foreignObject>; раскладка сверяется с оригиналом.
  *
  * Использование:
  *   1) Вставить в консоль — сразу скачает скриншот того, что видно на экране.
  *   2) <script src="inline.js" data-manual></script>, затем:
  *        await htmlShot.download();                               // видимая область
  *        await htmlShot.download({ fullPage: true });             // вся страница целиком
- *        await htmlShot.download({ target: document.querySelector('#app') });
- *        const canvas = await htmlShot.capture({ scale: 2 });
+ *        await htmlShot.download({ target: document.querySelector('#app') });  // элемент
+ *        const canvas = await htmlShot.captureNode('#chart');     // элемент → canvas
  *        const blob   = await htmlShot.toBlob({ type: 'image/jpeg', quality: 0.9 });
- *        await htmlShot.captureTab();                             // захват вкладки (нужен клик)
  *   Настройки до вставки в консоль: window.HTML_SHOT_CONFIG = { fullPage: true, ... }
- *   Элементы с атрибутом data-html-shot-ignore не попадают в скриншот.
+ *     method: 'auto' | 'pixel' | 'dom'   — 'dom' снимает без разрешений браузера
+ *     keepStream: true                   — спросить разрешение один раз на несколько снимков
+ *                                          (закрыть захват: htmlShot.stop())
+ *   Элементы с атрибутом data-html-shot-ignore не попадают в DOM-снимок.
  */
 (function (global) {
   'use strict';
@@ -36,7 +43,7 @@
     timeout: 15000,           // таймаут загрузки одного ресурса, мс
     corsProxy: null,          // 'https://my-proxy/?url=' | 'https://p/?u={url}' | (url) => proxiedUrl
     concurrency: 6,           // одновременных загрузок ресурсов
-    placeholder: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
+    placeholder: 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', // прозрачный пиксель
     filter: null,             // (element) => false, чтобы исключить элемент
     frameBudget: 12,          // мс непрерывной работы, после которых отдаём управление браузеру
     lazyImages: true,         // догрузить loading="lazy" картинки до снимка
@@ -44,7 +51,9 @@
     contentVisibility: true,  // раскрыть content-visibility:auto на время снимка
     jsFonts: true,            // встраивать шрифты, добавленные через FontFace API
     fallbackHtml2canvas: true,// если SVG-рендер не удался и на странице есть window.html2canvas
-    method: 'auto',           // download(): 'auto' | 'dom' | 'tab' (захват вкладки)
+    method: 'auto',           // 'auto' — пиксели вкладки (как «Capture node screenshot» в DevTools),
+                              //   а если браузер не дал разрешения — DOM-рендер; 'pixel' — только пиксели; 'dom' — без разрешений
+    keepStream: false,        // не закрывать захват вкладки между снимками: разрешение спросят один раз (htmlShot.stop())
     lockLayout: true,         // сверить копию с оригиналом и поставить съехавшие элементы на место
     ui: true,                 // всплывающие уведомления при download()
   };
@@ -1112,7 +1121,8 @@
     return global.html2canvas(target, h2cOpts);
   }
 
-  async function capture(userOpts = {}) {
+  // Снимок без разрешений: копия DOM → SVG → canvas
+  async function captureDom(userOpts = {}) {
     const opts = Object.assign({}, DEFAULTS, userOpts);
     concurrency = Math.max(1, opts.concurrency | 0 || 6);
     failed.clear();
@@ -1142,6 +1152,20 @@
     canvas.htmlShotReport = report;
     api.lastReport = report;
     return canvas;
+  }
+
+  // Главный вход: пиксели вкладки, а если их не дали (method: 'auto') — DOM-рендер
+  async function capture(userOpts = {}) {
+    const opts = Object.assign({}, DEFAULTS, userOpts);
+    if (opts.method === 'dom' || (opts.method === 'auto' && !pixelSupported())) return captureDom(opts);
+    try {
+      return await capturePixels(opts);
+    } catch (err) {
+      if (opts.method !== 'auto') throw err;
+      const canvas = await captureDom(opts);
+      canvas.htmlShotReport.pixelError = err && err.name;
+      return canvas;
+    }
   }
 
   function canvasToBlob(canvas, opts) {
@@ -1236,64 +1260,21 @@
     return parts.join(';\n');
   }
 
-  function offerTab(text, kind, opts) {
-    return new Promise((resolve, reject) => {
-      toast(text, kind || 'info', [
-        { label: '🎥 Снять через захват вкладки', onClick: () => downloadTab(opts).then(resolve, reject) },
-        { label: 'Закрыть', secondary: true, onClick: () => { removeToast(); resolve(null); } },
-      ], kind === 'warn' ? 20000 : 0);
-    });
+  function errorText(err) {
+    if (err && err.name === 'NotAllowedError') return 'Захват вкладки отменён.';
+    return (err && err.message) || String(err);
   }
 
-  async function downloadTab(opts) {
-    try {
-      const canvas = await captureTab(opts);
-      const blob = await canvasToBlob(canvas, opts);
-      const name = opts.filename || autoFilename(opts.type, '_tab');
-      saveBlob(blob, name);
-      if (opts.ui) toast(`✅ Сохранено: ${name}\n${Math.round(blob.size / 1024)} КБ`, 'ok', null, 4000);
-      return blob;
-    } catch (err) {
-      if (opts.ui) {
-        const msg = err && err.name === 'NotAllowedError' ? 'Захват вкладки отменён.' : (err && err.message || String(err));
-        toast('❌ ' + msg, 'error', [{ label: 'Закрыть', secondary: true, onClick: removeToast }], 10000);
-      }
-      throw err;
-    }
-  }
-
-  async function download(userOpts = {}) {
-    const opts = Object.assign({}, DEFAULTS, userOpts);
-    if (opts.method === 'tab') {
-      // Браузер даёт захват только по клику пользователя
-      if (!opts.ui) return downloadTab(opts);
-      return offerTab('Захват вкладки видит всё: картинки с любых сайтов, iframe, видео, WebGL.\n' +
-        'Браузер попросит разрешение — выберите эту вкладку.', 'info', opts);
-    }
-
-    const t0 = performance.now();
-    if (opts.ui) toast('📸 Снимаю ' + (opts.target ? 'элемент' : opts.fullPage ? 'страницу' : 'видимую область') + '…');
-    let canvas, blob;
-    try {
-      canvas = await capture(opts);
-      blob = await canvasToBlob(canvas, opts);
-    } catch (err) {
-      if (opts.ui) {
-        const canTab = opts.method === 'auto' && !opts.target && navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia;
-        const text = '❌ Не удалось сделать скриншот:\n' + (err && err.message || err);
-        if (canTab) offerTab(text + '\nМожно снять через захват вкладки.', 'error', opts).catch(() => {});
-        else toast(text, 'error', [{ label: 'Закрыть', secondary: true, onClick: removeToast }], 10000);
-      }
-      throw err;
-    }
+  async function saveCanvas(canvas, opts, t0) {
+    const blob = await canvasToBlob(canvas, opts);
     const name = opts.filename || autoFilename(opts.type);
     saveBlob(blob, name);
     const report = canvas.htmlShotReport;
     if (opts.ui) {
       const head = `✅ Сохранено: ${name}\n${Math.round(blob.size / 1024)} КБ, ${((performance.now() - t0) / 1000).toFixed(1)} с` +
-        (report.engine !== 'svg' ? ` (${report.engine})` : '');
-      if (report.problems && opts.method === 'auto' && !opts.target) {
-        offerTab(head + '\n⚠️ ' + describeProblems(report) + '.\nЗахват вкладки снимет всё как на экране.', 'warn', opts).catch(() => {});
+        (report.engine === 'pixel' ? '' : report.engine === 'svg' ? ' (DOM)' : ` (${report.engine})`);
+      if (report.problems && pixelSupported()) {
+        offerPixel(head + '\n⚠️ ' + describeProblems(report) + '.\nТочный снимок (пиксели вкладки) видит всё.', 'warn', opts);
       } else if (report.problems) {
         toast(head + '\n⚠️ ' + describeProblems(report) + '.', 'warn', null, 8000);
       } else {
@@ -1303,7 +1284,108 @@
     return blob;
   }
 
-  /* ---------------- захват вкладки (getDisplayMedia) ---------------- */
+  async function downloadPixel(opts) {
+    const t0 = performance.now();
+    return saveCanvas(await capturePixels(opts), opts, t0);
+  }
+
+  async function downloadDom(opts) {
+    const t0 = performance.now();
+    if (opts.ui) toast('📸 Снимаю ' + (opts.target ? 'элемент' : opts.fullPage ? 'страницу' : 'видимую область') + '…');
+    return saveCanvas(await captureDom(opts), opts, t0);
+  }
+
+  function offerPixel(text, kind, opts) {
+    toast(text, kind, [
+      { label: '📸 Снять точно', onClick: () => downloadPixel(opts).catch((e) => toast('❌ ' + errorText(e), 'error', null, 8000)) },
+      { label: 'Закрыть', secondary: true, onClick: removeToast },
+    ], 20000);
+  }
+
+  async function download(userOpts = {}) {
+    const opts = Object.assign({}, DEFAULTS, userOpts);
+    try {
+      if (opts.method === 'dom' || (opts.method === 'auto' && !pixelSupported())) return await downloadDom(opts);
+      try {
+        return await downloadPixel(opts);
+      } catch (err) {
+        // Захват вкладки браузер разрешает только по клику (из консоли DevTools клик не нужен)
+        if (err && err.name === 'InvalidStateError' && opts.ui) {
+          return await new Promise((resolve, reject) => toast('Для точного снимка браузеру нужен клик.', 'info', [
+            { label: '📸 Снять точно', onClick: () => downloadPixel(opts).then(resolve, (e) =>
+              (opts.method === 'auto' ? downloadDom(opts) : Promise.reject(e)).then(resolve, reject)) },
+            { label: 'Без разрешения', secondary: true, onClick: () => downloadDom(opts).then(resolve, reject) },
+          ]));
+        }
+        if (opts.method !== 'auto') throw err;
+        return await downloadDom(opts); // отказались, выбрали не ту вкладку, браузер не умеет
+      }
+    } catch (err) {
+      if (opts.ui) toast('❌ Не удалось сделать скриншот:\n' + errorText(err), 'error', [{ label: 'Закрыть', secondary: true, onClick: removeToast }], 10000);
+      throw err;
+    }
+  }
+
+  /* ---------------- пиксельный захват: как «Capture node screenshot» в DevTools ---------------- */
+  // Берёт готовые пиксели вкладки (getDisplayMedia) и вырезает нужное: экран, элемент или
+  // всю страницу (склейкой при прокрутке). Видно всё, что видит пользователь: картинки с
+  // любых сайтов, чужие iframe, видео, WebGL, закрытый Shadow DOM. Нужно разрешение браузера.
+
+  let live = null; // { stream, track, video } — открытый захват вкладки
+
+  function pixelSupported() {
+    const md = navigator.mediaDevices;
+    return !!(md && md.getDisplayMedia) && global.isSecureContext !== false;
+  }
+
+  function namedError(name, message) {
+    const e = new Error(message);
+    e.name = name;
+    return e;
+  }
+
+  function stop() {
+    if (live) { live.stream.getTracks().forEach((t) => t.stop()); live = null; }
+  }
+
+  async function openStream() {
+    if (live && live.track.readyState === 'live') return live;
+    live = null;
+    if (!pixelSupported()) throw namedError('NotSupportedError', 'Браузер не умеет захватывать вкладку (нужен Chrome/Edge/Firefox по https).');
+    const dpr = global.devicePixelRatio || 1;
+    const stream = await navigator.mediaDevices.getDisplayMedia({
+      video: {
+        displaySurface: 'browser', frameRate: { ideal: 30 },
+        width: { ideal: Math.round(screen.width * dpr) }, height: { ideal: Math.round(screen.height * dpr) },
+      },
+      audio: false, preferCurrentTab: true, selfBrowserSurface: 'include', surfaceSwitching: 'exclude', monitorTypeSurfaces: 'exclude',
+    });
+    const track = stream.getVideoTracks()[0];
+    const video = document.createElement('video');
+    video.muted = true; video.playsInline = true; video.srcObject = stream;
+    try {
+      await video.play();
+      for (let i = 0; i < 60 && !video.videoWidth; i++) await sleep(50);
+      // Панель «идёт демонстрация» уменьшает окно не сразу — ждём, пока кадр и окно совпадут
+      const settings = track.getSettings ? track.getSettings() : {};
+      const matches = () => {
+        const vw = global.innerWidth, vh = global.innerHeight;
+        return video.videoWidth && Math.abs(vw / vh - video.videoWidth / video.videoHeight) / (vw / vh) < 0.02;
+      };
+      let ok = false;
+      for (let i = 0; i < 25 && !(ok = matches()); i++) await sleep(100);
+      if (!ok || (settings.displaySurface && settings.displaySurface !== 'browser')) {
+        throw namedError('WrongSurfaceError', 'Выбрана не эта вкладка. Запустите снова и выберите текущую вкладку.');
+      }
+      await sleep(150);
+    } catch (e) {
+      stream.getTracks().forEach((t) => t.stop());
+      throw e;
+    }
+    live = { stream, track, video };
+    track.addEventListener('ended', () => { if (live && live.track === track) live = null; });
+    return live;
+  }
 
   function waitVideoFrame(video) {
     return new Promise((resolve) => {
@@ -1314,8 +1396,10 @@
     });
   }
 
+  // Свежий кадр: после прокрутки/скрытия уведомления вкладка должна перерисоваться
   async function grabFrame(video) {
-    await sleep(250);
+    await twoFrames();
+    await sleep(120);
     await waitVideoFrame(video);
     await waitVideoFrame(video);
     const c = document.createElement('canvas');
@@ -1324,11 +1408,12 @@
     return c;
   }
 
-  // При склейке фиксированные/липкие элементы остаются только на первом кадре
-  function hideFixedElements() {
+  // При склейке фиксированные/липкие элементы остаются только на первом кадре.
+  // Предков снимаемого элемента не прячем — иначе спрячется и он сам.
+  function hideFixedElements(keep) {
     const hidden = [];
     for (const el of document.querySelectorAll('body *')) {
-      if (el.hasAttribute(TOAST)) continue;
+      if (el.hasAttribute(TOAST) || (keep && el.contains(keep))) continue;
       const pos = getComputedStyle(el).position;
       if (pos === 'fixed' || pos === 'sticky') {
         hidden.push([el, el.style.getPropertyValue('visibility'), el.style.getPropertyPriority('visibility')]);
@@ -1338,69 +1423,125 @@
     return () => hidden.forEach(([el, v, p]) => (v ? el.style.setProperty('visibility', v, p) : el.style.removeProperty('visibility')));
   }
 
-  function scrollToY(y) {
-    try { global.scrollTo({ top: y, left: 0, behavior: 'instant' }); } catch (_) { global.scrollTo(0, y); }
+  function scrollToXY(x, y) {
+    try { global.scrollTo({ left: x, top: y, behavior: 'instant' }); } catch (_) { global.scrollTo(x, y); }
   }
 
-  // Нужен клик пользователя (transient activation). Снимает вкладку как видео: видно всё.
-  async function captureTab(userOpts = {}) {
+  // Запоминает прокрутку всех прокручиваемых предков элемента, чтобы вернуть её после снимка
+  function rememberScroll(el) {
+    const saved = [];
+    for (let n = el.parentElement; n; n = n.parentElement) {
+      if (n.scrollTop || n.scrollLeft || n.scrollHeight > n.clientHeight || n.scrollWidth > n.clientWidth) {
+        saved.push([n, n.scrollLeft, n.scrollTop]);
+      }
+    }
+    const wx = global.scrollX, wy = global.scrollY;
+    return () => {
+      saved.forEach(([n, x, y]) => { n.scrollLeft = x; n.scrollTop = y; });
+      scrollToXY(wx, wy);
+    };
+  }
+
+  function pixelReport(canvas) {
+    const report = { engine: 'pixel', failed: [], missingFonts: [], taintedCanvases: 0, moved: 0, problems: 0 };
+    canvas.htmlShotReport = report;
+    api.lastReport = report;
+    return canvas;
+  }
+
+  async function capturePixels(userOpts = {}) {
     const opts = Object.assign({}, DEFAULTS, userOpts);
-    const md = navigator.mediaDevices;
-    if (!md || !md.getDisplayMedia) throw new Error('Браузер не поддерживает захват вкладки (нужен Chrome/Edge/Firefox по https)');
-    const stream = await md.getDisplayMedia({
-      video: { displaySurface: 'browser', frameRate: 30 }, audio: false,
-      preferCurrentTab: true, selfBrowserSurface: 'include', surfaceSwitching: 'exclude', monitorTypeSurfaces: 'exclude',
-    });
-    const video = document.createElement('video');
-    video.muted = true; video.playsInline = true; video.srcObject = stream;
-    const startX = global.scrollX, startY = global.scrollY;
+    const target = opts.target && opts.target !== document.documentElement && opts.target !== document.body ? opts.target : null;
+    const s = await openStream();
+    const restoreScroll = target ? rememberScroll(target) : (() => { const x = global.scrollX, y = global.scrollY; return () => scrollToXY(x, y); })();
     let restoreFixed = () => {};
     removeToast();
     try {
-      await video.play();
-      for (let i = 0; i < 40 && !video.videoWidth; i++) await sleep(50);
-      await sleep(400); // панель «идёт демонстрация» меняет высоту окна
-      const vw = global.innerWidth, vh = global.innerHeight;
-      if (Math.abs(vw / vh - video.videoWidth / video.videoHeight) / (vw / vh) > 0.06) {
-        throw new Error('Похоже, выбрана не эта вкладка. Запустите снова и выберите текущую вкладку.');
-      }
-      const k = video.videoWidth / vw;
-      if (!opts.fullPage) return await grabFrame(video);
+      const video = s.video;
+      const kx = () => video.videoWidth / global.innerWidth, ky = () => video.videoHeight / global.innerHeight;
 
-      const de = document.documentElement;
-      const pageH = () => Math.max(de.scrollHeight, document.body ? document.body.scrollHeight : 0, vh);
-      let total = pageH();
-      const maxH = Math.floor(Math.min(32767, 268435456 / video.videoWidth) / k);
-      if (total > maxH) total = maxH; // лимит размера canvas
-      const out = document.createElement('canvas');
-      out.width = video.videoWidth;
-      out.height = Math.round(total * k);
-      const c2d = out.getContext('2d');
-      let y = 0, first = true;
-      for (let guard = 0; guard < 400; guard++) {
-        scrollToY(y);
-        const frame = await grabFrame(video);
-        const actual = global.scrollY;
-        c2d.drawImage(frame, 0, Math.round(actual * k));
-        if (first) { restoreFixed = hideFixedElements(); first = false; }
-        if (actual + vh >= total - 1 || actual + vh >= pageH() - 1) break;
-        y = actual + vh;
+      // 1) Только экран — кадр целиком, ровно то, что видит пользователь
+      if (!target && !opts.fullPage) return pixelReport(await grabFrame(video));
+
+      const vp = viewportSize(); // без полос прокрутки
+      // 2) Элемент помещается в окно — докручиваем до него (и внутри прокручиваемых блоков) и вырезаем
+      if (target) {
+        let r = target.getBoundingClientRect();
+        if (r.width <= vp.width && r.height <= vp.height) {
+          if (r.left < 0 || r.top < 0 || r.right > vp.width || r.bottom > vp.height) {
+            target.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'instant' });
+            await twoFrames();
+            r = target.getBoundingClientRect();
+          }
+          const frame = await grabFrame(video);
+          const x0 = Math.max(0, Math.floor(r.left)), y0 = Math.max(0, Math.floor(r.top));
+          const w = Math.max(1, Math.min(vp.width, Math.ceil(r.right)) - x0), h = Math.max(1, Math.min(vp.height, Math.ceil(r.bottom)) - y0);
+          const out = document.createElement('canvas');
+          out.width = Math.round(w * kx()); out.height = Math.round(h * ky());
+          out.getContext('2d').drawImage(frame, x0 * kx(), y0 * ky(), out.width, out.height, 0, 0, out.width, out.height);
+          return pixelReport(out);
+        }
       }
-      return out;
+
+      // 3) Больше окна (вся страница или крупный элемент) — склейка кадров при прокрутке окна
+      const de = document.documentElement;
+      let region;
+      if (target) {
+        const r = target.getBoundingClientRect();
+        const x = Math.floor(r.left + global.scrollX), y = Math.floor(r.top + global.scrollY);
+        region = { x, y, w: Math.ceil(r.right + global.scrollX) - x, h: Math.ceil(r.bottom + global.scrollY) - y };
+      } else {
+        region = {
+          x: 0, y: 0,
+          w: Math.max(de.scrollWidth, document.body ? document.body.scrollWidth : 0, vp.width),
+          h: Math.max(de.scrollHeight, document.body ? document.body.scrollHeight : 0, vp.height),
+        };
+      }
+      let W = Math.round(region.w * kx()), H = Math.round(region.h * ky());
+      if (W > 32767) { W = 32767; region.w = Math.floor(W / kx()); }
+      const maxH = Math.floor(Math.min(32767, 268435456 / W));
+      if (H > maxH) { H = maxH; region.h = Math.floor(H / ky()); } // лимит размера canvas
+      const out = document.createElement('canvas');
+      out.width = W; out.height = H;
+      const c2d = out.getContext('2d');
+      let tiles = 0;
+      for (let ty = region.y; ty < region.y + region.h; ty += vp.height) {
+        for (let tx = region.x; tx < region.x + region.w; tx += vp.width) {
+          const bw = Math.min(vp.width, region.x + region.w - tx), bh = Math.min(vp.height, region.y + region.h - ty);
+          const inView = tx >= global.scrollX && ty >= global.scrollY &&
+            tx + bw <= global.scrollX + vp.width && ty + bh <= global.scrollY + vp.height;
+          if (!inView) scrollToXY(tx, ty);
+          const frame = await grabFrame(video);
+          const ax = global.scrollX, ay = global.scrollY; // браузер мог упереться в край страницы
+          c2d.drawImage(frame, (tx - ax) * kx(), (ty - ay) * ky(), bw * kx(), bh * ky(),
+            (tx - region.x) * kx(), (ty - region.y) * ky(), bw * kx(), bh * ky());
+          if (++tiles === 1) restoreFixed = hideFixedElements(target);
+          if (tiles > 400) break;
+        }
+      }
+      return pixelReport(out);
     } finally {
       restoreFixed();
-      stream.getTracks().forEach((t) => t.stop());
-      global.scrollTo(startX, startY);
+      restoreScroll();
+      if (!opts.keepStream) stop();
     }
   }
 
-  const api = { version: '7.4', capture, toBlob, toDataURL: toDataURLApi, download, captureTab, defaults: DEFAULTS, lastReport: null };
+  // Снимок одного элемента по-пиксельно — аналог «Capture node screenshot»
+  function captureNode(el, userOpts = {}) {
+    return capture(Object.assign({}, userOpts, { target: typeof el === 'string' ? document.querySelector(el) : el }));
+  }
+
+  const api = {
+    version: '8.0', capture, captureNode, capturePixels, captureDom, toBlob, toDataURL: toDataURLApi, download,
+    captureTab: capturePixels, stop, defaults: DEFAULTS, lastReport: null,
+  };
   global.htmlShot = api;
 
   // Автозапуск (если вставили в консоль или подключили без data-manual)
   if (!(currentScript && currentScript.hasAttribute('data-manual'))) {
     const run = () => {
-      // Настройки без правки файла: window.HTML_SHOT_CONFIG = { fullPage: true, method: 'tab' }
+      // Настройки без правки файла: window.HTML_SHOT_CONFIG = { fullPage: true, method: 'dom' }
       api.download(global.HTML_SHOT_CONFIG || {})
         .catch(() => { /* ошибка уже показана в уведомлении */ });
     };
