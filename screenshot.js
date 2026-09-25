@@ -1,7 +1,8 @@
 /*!
  * Скриншот страницы в PNG — вставьте в консоль браузера (F12 → Console) и нажмите Enter.
  * Встроены: html2canvas-pro 2.4.5 (MIT, https://github.com/yorickshan/html2canvas-pro)
- *           + modern capture layer (анимации, lazy-картинки, шрифты, color-mix/oklch, content-visibility, shadow DOM)
+ *           + modern capture layer (анимации, lazy-картинки, шрифты, color-mix/oklch, content-visibility, shadow DOM,
+ *             SVG-спрайты <use>, иконки на mask-image и SVG-фоне, image-set(), -webkit-text-fill-color)
  * Настройки — в объекте CONFIG ближе к концу файла.
  */
 (function () {
@@ -12071,6 +12072,20 @@
    *      Решение: браузер сам переводит любой цвет в rgba через 1px canvas.
    *   7. Shadow DOM (веб-компоненты) обходится везде.
    *   8. Нормальные умолчания: useCORS, без логов в консоль.
+   *   9. SVG-иконки из спрайтов (<use href="#icon">, внешние sprite.svg#icon),
+   *      градиенты/clipPath по url(#id), <image> внутри SVG -> SVG рисуется как
+   *      отдельная картинка, ссылки на остальной документ теряются, иконки пустые/чёрные.
+   *      Решение: нужные <symbol>/<defs> копируются внутрь каждого SVG.
+   *  10. Иконки через mask-image / -webkit-mask-image (Iconify, Tailwind, большинство
+   *      современных UI-китов) -> html2canvas не умеет маски, выходят цветные квадраты.
+   *      Решение: маска заранее рисуется в картинку нужного цвета.
+   *      SVG-фоны без width/height html2canvas рисует крошечными — их тоже растрируем.
+   *  11. image-set() в background-image -> фон/иконка пропадает. Берём подходящий url().
+   *  12. -webkit-text-fill-color игнорируется -> текст другого цвета.
+   *  13. Шрифты в клоне начинали грузиться уже после проверки fonts.ready -> текст
+   *      раскладывался запасным шрифтом (другая ширина/переносы/размер).
+   *      Решение: явная загрузка тех же начертаний и unicode-range (кириллица!),
+   *      что загружены на странице, и наоборот.
    * ==================================================================== */
 
   var UID_ATTR = 'data-h2c-uid';
@@ -12094,6 +12109,11 @@
     fonts: true,
     colors: true,
     contentVisibility: true,
+    svgRefs: true,
+    masks: true,
+    svgBackgrounds: true,
+    imageSet: true,
+    textFill: true,
     waitTimeout: 5000
   };
 
@@ -12235,15 +12255,47 @@
   }
 
   /* ---------- 5. Шрифты ---------- */
-  function copyFonts(srcDoc, clonedDoc, timeout) {
+  function fontKey(face) {
+    return [String(face.family).replace(/["']/g, '').trim().toLowerCase(),
+      face.style, face.weight, face.stretch, face.unicodeRange].join('|');
+  }
+
+  function listFaces(set) {
+    var out = [];
+    try { set.forEach(function (face) { out.push(face); }); } catch (e) {}
+    return out;
+  }
+
+  function loadedKeys(faces) {
+    var keys = {};
+    faces.forEach(function (face) { if (face.status === 'loaded') keys[fontKey(face)] = true; });
+    return keys;
+  }
+
+  function loadMatching(faces, keys) {
+    return Promise.all(faces.filter(function (face) {
+      return face.status === 'unloaded' && keys[fontKey(face)];
+    }).map(function (face) { return face.load().catch(function () {}); }));
+  }
+
+  // Шрифты в клоне грузятся лениво: fonts.ready резолвится раньше, чем начинается
+  // загрузка, и раскладка идёт запасным шрифтом. Поэтому явно грузим в клоне всё,
+  // что уже загружено на странице (с учётом unicode-range: кириллица — отдельный файл),
+  // а на странице — всё, что понадобилось клону (content-visibility, текст ниже экрана):
+  // текст рисуется на canvas основного документа его шрифтами.
+  function syncFonts(srcDoc, clonedDoc, timeout) {
     if (!srcDoc.fonts || !clonedDoc.fonts) return Promise.resolve();
-    try {
-      srcDoc.fonts.forEach(function (face) {
-        if (face.status !== 'loaded') return;
-        try { clonedDoc.fonts.add(face); } catch (e) { /* CSS-connected — и так есть в клоне */ }
-      });
-    } catch (e) {}
-    return withTimeout(clonedDoc.fonts.ready, timeout);
+    var srcFaces = listFaces(srcDoc.fonts);
+    srcFaces.forEach(function (face) {
+      if (face.status !== 'loaded') return;
+      try { clonedDoc.fonts.add(face); } catch (e) { /* CSS-connected — и так есть в клоне */ }
+    });
+    try { void clonedDoc.documentElement.offsetHeight; } catch (e) {} // запустить загрузку по раскладке
+    var toClone = loadMatching(listFaces(clonedDoc.fonts), loadedKeys(srcFaces))
+      .then(function () { return clonedDoc.fonts.ready; });
+    return withTimeout(toClone, timeout).then(function () {
+      return withTimeout(loadMatching(srcFaces, loadedKeys(listFaces(clonedDoc.fonts))), timeout);
+    });
   }
 
   /* ---------- 6. Цвета ---------- */
@@ -12277,14 +12329,16 @@
     };
   }
 
-  function replaceColorFunctions(value, resolve) {
-    COLOR_FN_RE.lastIndex = 0;
-    if (!COLOR_FN_RE.test(value)) return null;
+  // Заменяет вызовы CSS-функций (с учётом вложенных скобок) через map(fnText).
+  // re: /(^|[^\w-])(name)\(/gi. Возвращает null, если совпадений нет.
+  function replaceCssFunctions(value, re, map) {
+    re.lastIndex = 0;
+    if (!re.test(value)) return null;
     var result = '';
     var i = 0;
-    COLOR_FN_RE.lastIndex = 0;
+    re.lastIndex = 0;
     var m;
-    while ((m = COLOR_FN_RE.exec(value))) {
+    while ((m = re.exec(value))) {
       var start = m.index + m[1].length;
       var depth = 0;
       var j = start + m[2].length;
@@ -12294,11 +12348,15 @@
         else if (c === ')') { depth--; if (depth === 0) break; }
       }
       var fn = value.slice(start, j + 1);
-      result += value.slice(i, start) + resolve(fn);
+      result += value.slice(i, start) + map(fn);
       i = j + 1;
-      COLOR_FN_RE.lastIndex = i;
+      re.lastIndex = i;
     }
     return result + value.slice(i);
+  }
+
+  function replaceColorFunctions(value, resolve) {
+    return replaceCssFunctions(value, COLOR_FN_RE, resolve);
   }
 
   function normalizeColors(clonedDoc, clonedEl) {
@@ -12318,6 +12376,417 @@
     walk(clonedEl, fixEl);
     var up = composedParent(clonedEl);
     while (up && up.nodeType === 1) { fixEl(up); up = composedParent(up); }
+  }
+
+  /* ---------- Загрузка ресурсов ---------- */
+  var dataUrlCache = new Map();
+  function fetchDataURL(url, timeout) {
+    if (/^data:/i.test(url)) return Promise.resolve(url);
+    if (!dataUrlCache.has(url)) {
+      dataUrlCache.set(url, withTimeout(fetch(url, { credentials: 'same-origin' })
+        .then(function (r) { if (!r.ok) throw new Error(r.status); return r.blob(); })
+        .then(function (blob) {
+          return new Promise(function (res, rej) {
+            var fr = new FileReader();
+            fr.onload = function () { res(fr.result); };
+            fr.onerror = rej;
+            fr.readAsDataURL(blob);
+          });
+        }), timeout).then(function (v) { return v || null; }));
+    }
+    return dataUrlCache.get(url);
+  }
+
+  var svgDocCache = new Map();
+  function fetchSvgDoc(url, timeout) {
+    if (!svgDocCache.has(url)) {
+      svgDocCache.set(url, withTimeout(fetch(url, { credentials: 'same-origin' })
+        .then(function (r) { if (!r.ok) throw new Error(r.status); return r.text(); })
+        .then(function (text) { return new DOMParser().parseFromString(text, 'image/svg+xml'); }), timeout)
+        .then(function (d) { return d || null; }));
+    }
+    return svgDocCache.get(url);
+  }
+
+  var imageCache = new Map();
+  function loadImage(url, timeout) {
+    if (!imageCache.has(url)) {
+      imageCache.set(url, withTimeout(new Promise(function (res, rej) {
+        var img = new Image();
+        if (!/^(data|blob):/i.test(url)) img.crossOrigin = 'anonymous';
+        img.onload = function () { res(img); };
+        img.onerror = rej;
+        img.src = url;
+      }), timeout).then(function (img) { return img || null; }));
+    }
+    return imageCache.get(url);
+  }
+
+  function cssEscape(s) {
+    return window.CSS && CSS.escape ? CSS.escape(s) : String(s).replace(/["\\]/g, '\\$&');
+  }
+
+  /* ---------- 11, 12. image-set() и -webkit-text-fill-color ---------- */
+  var IMAGE_SET_RE = /(^|[^\w-])((?:-webkit-)?image-set)\(/gi;
+  var IMAGE_PROPS = ['background-image', 'list-style-image', 'border-image-source', 'mask-image', '-webkit-mask-image'];
+
+  function splitTopLevel(str) {
+    var parts = [], depth = 0, quote = null, last = 0;
+    for (var i = 0; i < str.length; i++) {
+      var c = str[i];
+      if (quote) { if (c === '\\') i++; else if (c === quote) quote = null; continue; }
+      if (c === '"' || c === "'") quote = c;
+      else if (c === '(') depth++;
+      else if (c === ')') depth--;
+      else if (c === ',' && depth === 0) { parts.push(str.slice(last, i)); last = i + 1; }
+    }
+    parts.push(str.slice(last));
+    return parts;
+  }
+
+  // image-set("a.png" 1x, "a@2x.png" 2x) -> url("a@2x.png") под текущий devicePixelRatio
+  function pickImageSet(fn, dpr) {
+    var inner = fn.slice(fn.indexOf('(') + 1, -1);
+    var best = null;
+    splitTopLevel(inner).forEach(function (item) {
+      var m = /url\(\s*(['"]?)(.*?)\1\s*\)/.exec(item) || /(['"])(.*?)\1/.exec(item);
+      if (!m) return;
+      var rest = item.slice(m.index + m[0].length);
+      var r = /(\d*\.?\d+)(x|dppx|dpi|dpcm)\b/.exec(rest);
+      var res = 1;
+      if (r) res = r[2] === 'dpi' ? r[1] / 96 : r[2] === 'dpcm' ? r[1] / 37.795 : +r[1];
+      var better = !best ||
+        (res >= dpr && (best.res < dpr || res < best.res)) ||
+        (res < dpr && best.res < dpr && res > best.res);
+      if (better) best = { url: m[2], res: res };
+    });
+    return best ? 'url("' + best.url + '")' : 'none';
+  }
+
+  function normalizeTextAndImages(clonedDoc, clonedEl, fix, dpr) {
+    var win = clonedDoc.defaultView;
+    walk(clonedEl, function (el) {
+      var cs;
+      try { cs = win.getComputedStyle(el); } catch (e) { return; }
+      if (fix.imageSet) {
+        IMAGE_PROPS.forEach(function (p) {
+          var v = cs.getPropertyValue(p);
+          if (!v || v.indexOf('image-set') === -1) return;
+          var fixed = replaceCssFunctions(v, IMAGE_SET_RE, function (fn) { return pickImageSet(fn, dpr); });
+          if (fixed !== null && fixed !== v) el.style.setProperty(p, fixed, 'important');
+        });
+      }
+      if (fix.textFill) {
+        // html2canvas заливает текст цветом color; браузер — -webkit-text-fill-color.
+        // Градиентный текст (background-clip: text) html2canvas обрабатывает сам.
+        var fill = cs.getPropertyValue('-webkit-text-fill-color');
+        var clip = cs.getPropertyValue('background-clip') + ' ' + cs.getPropertyValue('-webkit-background-clip');
+        if (fill && fill !== cs.color && clip.indexOf('text') === -1) {
+          el.style.setProperty('color', fill, 'important');
+        }
+      }
+    });
+  }
+
+  /* ---------- 9. Ссылки внутри SVG (спрайты, градиенты, <image>) ---------- */
+  var SVG_NS = 'http://www.w3.org/2000/svg';
+  var XLINK_NS = 'http://www.w3.org/1999/xlink';
+  var URL_REF_RE = /url\(\s*(['"]?)([^'")]*?)#([^'")\s]+)\1\s*\)/g;
+  var URL_REF_ATTRS = ['style', 'fill', 'stroke', 'clip-path', 'mask', 'filter', 'marker-start', 'marker-mid', 'marker-end'];
+  var HREF_TAGS = /^(use|image|feimage|textpath|lineargradient|radialgradient|pattern|filter|mpath)$/;
+  // Стили из CSS страницы, которые пропадут, когда SVG станет отдельной картинкой
+  var SVG_STYLE_PROPS = ['fill', 'fill-opacity', 'fill-rule', 'stroke', 'stroke-width', 'stroke-opacity',
+    'stroke-linecap', 'stroke-linejoin', 'stroke-dasharray', 'stroke-dashoffset', 'stroke-miterlimit',
+    'opacity', 'color', 'stop-color', 'stop-opacity', 'clip-rule', 'vector-effect', 'paint-order'];
+
+  function getHref(el) {
+    return el.getAttribute('href') || el.getAttributeNS(XLINK_NS, 'href') || el.getAttribute('xlink:href');
+  }
+
+  function setHref(el, value) {
+    if (el.hasAttribute('href') || !el.hasAttributeNS(XLINK_NS, 'href')) el.setAttribute('href', value);
+    if (el.hasAttributeNS(XLINK_NS, 'href')) el.setAttributeNS(XLINK_NS, 'xlink:href', value);
+  }
+
+  // Копирует узел из исходного документа, переносит в style то, что задано CSS
+  // (а не унаследовано), чтобы символ по-прежнему наследовал цвет от <use>.
+  function importSvgNode(srcEl, clonedDoc) {
+    var copy = clonedDoc.importNode(srcEl, true);
+    var win = srcEl.ownerDocument.defaultView;
+    if (!win) return copy; // внешний sprite.svg — computed-стилей нет
+    var src = [srcEl].concat([].slice.call(srcEl.querySelectorAll('*')));
+    var dst = [copy].concat([].slice.call(copy.querySelectorAll('*')));
+    for (var i = 0; i < src.length && i < dst.length; i++) {
+      var parent = src[i].parentElement;
+      if (!parent) continue;
+      var cs, pcs;
+      try { cs = win.getComputedStyle(src[i]); pcs = win.getComputedStyle(parent); } catch (e) { continue; }
+      for (var k = 0; k < SVG_STYLE_PROPS.length; k++) {
+        var p = SVG_STYLE_PROPS[k];
+        var v = cs.getPropertyValue(p);
+        if (!v || v === pcs.getPropertyValue(p)) continue;
+        if ((p === 'fill' || p === 'stroke') && v === cs.getPropertyValue('color')) v = 'currentColor';
+        dst[i].style.setProperty(p, v);
+      }
+    }
+    return copy;
+  }
+
+  function makeSvgRefResolver(doc, timeout) {
+    var docUrl = doc.location ? doc.location.href.split('#')[0] : '';
+    var shadowRoots = null;
+    function findById(id) {
+      var el = doc.getElementById(id);
+      if (el && el.namespaceURI === SVG_NS) return el;
+      if (!shadowRoots) {
+        shadowRoots = [];
+        walk(doc.documentElement, function (e) { if (e.shadowRoot) shadowRoots.push(e.shadowRoot); });
+      }
+      for (var i = 0; i < shadowRoots.length; i++) {
+        el = shadowRoots[i].getElementById(id);
+        if (el && el.namespaceURI === SVG_NS) return el;
+      }
+      return null;
+    }
+    function parseRef(ref) {
+      var i = ref.indexOf('#');
+      if (i < 0) return null;
+      var base = ref.slice(0, i), id = ref.slice(i + 1);
+      try { id = decodeURIComponent(id); } catch (e) {}
+      if (!id) return null;
+      if (!base || base === docUrl) return { id: id, url: null };
+      try { base = new URL(base, doc.baseURI).href; } catch (e) { return null; }
+      return { id: id, url: base === docUrl ? null : base };
+    }
+
+    return function inline(svg) {
+      var cdoc = svg.ownerDocument;
+      var defs = null;
+      var pending = [];
+      function getDefs() {
+        if (!defs) {
+          defs = cdoc.createElementNS(SVG_NS, 'defs');
+          svg.insertBefore(defs, svg.firstChild);
+        }
+        return defs;
+      }
+      function has(id) {
+        try { return !!svg.querySelector('[id="' + cssEscape(id) + '"]'); } catch (e) { return true; }
+      }
+      function adopt(srcEl) {
+        var copy = importSvgNode(srcEl, cdoc);
+        getDefs().appendChild(copy);
+        scan(copy);
+      }
+      function ensure(id, extDoc) {
+        if (has(id)) return;
+        var src = extDoc ? extDoc.getElementById(id) : findById(id);
+        if (!src) return;
+        if (extDoc) {
+          // <style> внешнего спрайта тоже нужны
+          [].forEach.call(extDoc.querySelectorAll('style'), function (st) { getDefs().appendChild(cdoc.importNode(st, true)); });
+        }
+        adopt(src);
+      }
+      function processEl(el) {
+        var tag = (el.localName || '').toLowerCase();
+        var href = HREF_TAGS.test(tag) ? getHref(el) : null;
+        if (href) {
+          if ((tag === 'image' || tag === 'feimage') && href.charAt(0) !== '#') {
+            // SVG-как-картинка не загружает внешние ресурсы — встраиваем
+            if (!/^data:/i.test(href)) {
+              var abs;
+              try { abs = new URL(href, doc.baseURI).href; } catch (e) { abs = null; }
+              if (abs) pending.push(fetchDataURL(abs, timeout).then(function (d) { if (d) setHref(el, d); }));
+            }
+          } else {
+            var ref = parseRef(href);
+            if (ref && !ref.url) {
+              if (href !== '#' + ref.id) setHref(el, '#' + ref.id);
+              ensure(ref.id, null);
+            } else if (ref && tag === 'use') {
+              pending.push(fetchSvgDoc(ref.url, timeout).then(function (extDoc) {
+                if (!extDoc) return;
+                setHref(el, '#' + ref.id);
+                ensure(ref.id, extDoc);
+              }));
+            }
+          }
+        }
+        URL_REF_ATTRS.forEach(function (a) {
+          var v = el.getAttribute(a);
+          if (!v || v.indexOf('url(') === -1) return;
+          var ids = [];
+          var out = v.replace(URL_REF_RE, function (all, q, base, id) {
+            var ref = parseRef(base + '#' + id);
+            if (!ref || ref.url) return all;
+            ids.push(ref.id);
+            return 'url("#' + ref.id + '")';
+          });
+          if (out !== v) el.setAttribute(a, out);
+          ids.forEach(function (id) { ensure(id, null); });
+        });
+      }
+      function scan(root) {
+        processEl(root);
+        [].forEach.call(root.querySelectorAll('*'), processEl);
+      }
+      function drain() {
+        if (!pending.length) return Promise.resolve();
+        var p = pending;
+        pending = [];
+        return Promise.all(p.map(function (x) { return x.catch(function () {}); })).then(drain);
+      }
+      scan(svg);
+      return drain();
+    };
+  }
+
+  function inlineSvgRefs(doc, clonedEl, timeout) {
+    var inline = makeSvgRefResolver(doc, timeout);
+    var jobs = [];
+    walk(clonedEl, function (el) {
+      if ((el.localName || '').toLowerCase() === 'svg' && el.namespaceURI === SVG_NS && !el.ownerSVGElement) {
+        try { jobs.push(inline(el)); } catch (e) {}
+      }
+    });
+    return withTimeout(Promise.all(jobs), timeout);
+  }
+
+  /* ---------- 10. Иконки на mask-image ---------- */
+  function cssLength(token, box) {
+    if (!token || token === 'auto') return null;
+    if (/%$/.test(token)) return box * parseFloat(token) / 100;
+    var n = parseFloat(token);
+    return isNaN(n) ? null : n;
+  }
+
+  function cssPosition(token, free) {
+    if (!token) return free / 2;
+    if (token === 'left' || token === 'top') return 0;
+    if (token === 'center') return free / 2;
+    if (token === 'right' || token === 'bottom') return free;
+    if (/%$/.test(token)) return free * parseFloat(token) / 100;
+    var n = parseFloat(token);
+    return isNaN(n) ? 0 : n;
+  }
+
+  function layerProp(cs, prefix, name) {
+    if (prefix === 'background') return cs.getPropertyValue('background-' + name).trim();
+    return (cs.getPropertyValue('mask-' + name) || cs.getPropertyValue('-webkit-mask-' + name) || '').trim();
+  }
+
+  // Рисует слой (background-* или mask-*) с картинкой img в canvas размером w×h
+  // по правилам size / position / repeat.
+  function paintLayer(cs, prefix, img, w, h, scale) {
+    var iw = img.naturalWidth || w, ih = img.naturalHeight || h;
+    var size = layerProp(cs, prefix, 'size') || 'auto';
+    var dw, dh;
+    if (size === 'contain' || size === 'cover') {
+      var r = (size === 'contain' ? Math.min : Math.max)(w / iw, h / ih);
+      dw = iw * r; dh = ih * r;
+    } else {
+      var sz = size.split(/\s+/);
+      dw = cssLength(sz[0], w); dh = cssLength(sz[1] || 'auto', h);
+      if (dw === null && dh === null) { dw = iw; dh = ih; }
+      else if (dw === null) dw = dh * iw / ih;
+      else if (dh === null) dh = dw * ih / iw;
+    }
+    if (!(dw > 0 && dh > 0)) return null;
+    var pos = (layerProp(cs, prefix, 'position') || '0% 0%').split(/\s+/);
+    var x = cssPosition(pos[0], w - dw), y = cssPosition(pos[1] || 'center', h - dh);
+    var rep = (layerProp(cs, prefix, 'repeat') || 'repeat').split(/\s+/);
+    if (rep.length === 1) {
+      rep = rep[0] === 'repeat-x' ? ['repeat', 'no-repeat']
+        : rep[0] === 'repeat-y' ? ['no-repeat', 'repeat'] : [rep[0], rep[0]];
+    }
+    var repX = rep[0] !== 'no-repeat', repY = rep[1] !== 'no-repeat';
+
+    var canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(w * scale));
+    canvas.height = Math.max(1, Math.round(h * scale));
+    var ctx = canvas.getContext('2d');
+    var x0 = repX ? x - Math.ceil(x / dw) * dw : x, y0 = repY ? y - Math.ceil(y / dh) * dh : y;
+    for (var ty = y0; ty < h; ty += dh) {
+      for (var tx = x0; tx < w; tx += dw) {
+        ctx.drawImage(img, tx * scale, ty * scale, dw * scale, dh * scale);
+        if (!repX) break;
+      }
+      if (!repY) break;
+    }
+    return canvas;
+  }
+
+  function renderMask(el, cs, img, scale) {
+    var w = el.offsetWidth, h = el.offsetHeight;
+    if (!w || !h) return null;
+    var mask = paintLayer(cs, 'mask', img, w, h, scale);
+    if (!mask) return null;
+    var out = document.createElement('canvas');
+    out.width = mask.width; out.height = mask.height;
+    var ctx = out.getContext('2d');
+    ctx.fillStyle = cs.backgroundColor;
+    ctx.fillRect(0, 0, out.width, out.height);
+    ctx.globalCompositeOperation = 'destination-in';
+    ctx.drawImage(mask, 0, 0);
+    return out.toDataURL('image/png'); // бросит SecurityError для чужой картинки без CORS
+  }
+
+  function singleUrl(v) {
+    var m = v && /^url\(\s*(['"]?)(.*)\1\s*\)$/.exec(v.trim());
+    return m ? m[2] : null;
+  }
+
+  var SVG_URL_RE = /^data:image\/svg\+xml|\.svgz?([?#]|$)/i;
+
+  function bakeMasks(clonedDoc, clonedEl, fix, scale, timeout) {
+    var win = clonedDoc.defaultView;
+    var jobs = [];
+    function set(el, props) {
+      Object.keys(props).forEach(function (p) { el.style.setProperty(p, props[p], 'important'); });
+    }
+    walk(clonedEl, function (el) {
+      if (el.namespaceURI === SVG_NS) return;
+      var cs;
+      try { cs = win.getComputedStyle(el); } catch (e) { return; }
+
+      var maskUrl = fix.masks ? singleUrl(layerProp(cs, 'mask', 'image')) : null; // градиентные маски не трогаем
+      if (maskUrl) {
+        if (cs.backgroundImage !== 'none' || /^(transparent|rgba\(.*,\s*0\))$/.test(cs.backgroundColor)) return;
+        if (el.children.length || el.textContent.trim()) return; // только "пустые" элементы-иконки
+        jobs.push(loadImage(maskUrl, timeout).then(function (img) {
+          if (!img) return;
+          var data = renderMask(el, cs, img, scale);
+          if (!data) return;
+          set(el, {
+            'background-image': 'url("' + data + '")', 'background-color': 'transparent',
+            'background-size': '100% 100%', 'background-position': '0 0', 'background-repeat': 'no-repeat',
+            'background-origin': 'border-box', 'background-clip': 'border-box',
+            'mask': 'none', '-webkit-mask': 'none', 'mask-image': 'none', '-webkit-mask-image': 'none'
+          });
+        }).catch(function () {}));
+        return;
+      }
+
+      // SVG-фон без width/height (типичная иконка): html2canvas берёт неверный
+      // размер и рисует его крошечным — заранее растрируем по правилам браузера.
+      var bgUrl = fix.svgBackgrounds ? singleUrl(cs.backgroundImage) : null;
+      if (bgUrl && SVG_URL_RE.test(bgUrl) && cs.backgroundAttachment !== 'fixed') {
+        var w = el.clientWidth, h = el.clientHeight; // padding-box
+        if (!w || !h || cs.backgroundOrigin !== 'padding-box') return;
+        jobs.push(loadImage(bgUrl, timeout).then(function (img) {
+          if (!img) return;
+          var canvas = paintLayer(cs, 'background', img, w, h, scale);
+          if (!canvas) return;
+          set(el, {
+            'background-image': 'url("' + canvas.toDataURL('image/png') + '")',
+            'background-size': '100% 100%', 'background-position': '0 0', 'background-repeat': 'no-repeat',
+            'background-origin': 'padding-box'
+          });
+        }).catch(function () {}));
+      }
+    });
+    return withTimeout(Promise.all(jobs), timeout);
   }
 
   /* ---------- 2, 3. Глобальный стиль для клона ---------- */
@@ -12346,6 +12815,7 @@
     if (options.useCORS === undefined) options.useCORS = true;
     if (options.logging === undefined) options.logging = false;
 
+    var scale = options.scale || win.devicePixelRatio || 1;
     var userOnClone = options.onclone;
     var snapshots = [];
     var restoreLazy = function () {};
@@ -12355,15 +12825,35 @@
     options.onclone = function (clonedDoc, clonedEl) {
       injectCloneStyle(clonedDoc, fix, options.cspNonce);
       if (fix.animations) applyAnimationSnapshots(clonedDoc, snapshots);
-      var p = fix.fonts ? copyFonts(doc, clonedDoc, fix.waitTimeout) : Promise.resolve();
-      return p.then(function () {
-        if (fix.colors) {
-          try { normalizeColors(clonedDoc, clonedEl || clonedDoc.documentElement); } catch (e) {
-            if (options.logging) console.warn('html2canvas: color normalization failed', e);
+      var target = clonedEl || clonedDoc.documentElement;
+      function step(name, fn) {
+        return function () {
+          try {
+            return Promise.resolve(fn()).catch(function (e) {
+              if (options.logging) console.warn('html2canvas: ' + name + ' failed', e);
+            });
+          } catch (e) {
+            if (options.logging) console.warn('html2canvas: ' + name + ' failed', e);
           }
-        }
-        if (typeof userOnClone === 'function') return userOnClone(clonedDoc, clonedEl);
-      });
+        };
+      }
+      var p = fix.fonts ? syncFonts(doc, clonedDoc, fix.waitTimeout) : Promise.resolve();
+      return p
+        .then(step('color normalization', function () {
+          if (fix.colors) normalizeColors(clonedDoc, target);
+        }))
+        .then(step('text/image-set normalization', function () {
+          if (fix.textFill || fix.imageSet) normalizeTextAndImages(clonedDoc, target, fix, scale);
+        }))
+        .then(step('svg references', function () {
+          if (fix.svgRefs) return inlineSvgRefs(doc, target, fix.waitTimeout);
+        }))
+        .then(step('mask icons', function () {
+          if (fix.masks || fix.svgBackgrounds) return bakeMasks(clonedDoc, target, fix, scale, fix.waitTimeout);
+        }))
+        .then(function () {
+          if (typeof userOnClone === 'function') return userOnClone(clonedDoc, clonedEl);
+        });
     };
 
     var prep = Promise.resolve();
@@ -12397,7 +12887,7 @@
   html2canvas.core = core;
   html2canvas.default = html2canvas;
   html2canvas.html2canvas = html2canvas;
-  html2canvas.version = 'modern-1.0 (core: html2canvas-pro 2.4.5)';
+  html2canvas.version = 'modern-1.1 (core: html2canvas-pro 2.4.5)';
   return html2canvas;
   })();
 
