@@ -18,6 +18,9 @@
  *   await htmlShot.captureTab()  — захват вкладки (видит всё, но спросит разрешение; нужен клик).
  *   htmlShot.lastReport          — что не удалось встроить в последний снимок.
  *
+ * Новое в v7.3: элементы ставятся на место через left/top, а не transform — ручки-разделители
+ *   и другие элементы с z-index поверх соседних панелей больше не пропадают.
+ *
  * Новое в v7.2: содержимое iframe (например, график TradingView) — absolute/fixed элементы
  *   внутри фрейма больше не улетают к углу снимка, сверка раскладки работает и внутри фреймов.
  *
@@ -602,6 +605,7 @@
     if (ctx.pairs) {
       pairIdx = ctx.pairs.push({
         node, el, parent: flags.pIdx === undefined ? -1 : flags.pIdx, inFixed, frame: flags.frame || null,
+        rtl: cs.direction === 'rtl',
         movable: isHTML && !flags.warped && canTranslate(cloneTag, cs.display),
       }) - 1;
     }
@@ -638,9 +642,13 @@
     if (tag === 'textarea') style += 'resize:none;';
     if (node === doc.activeElement && !isDocRoot) style += 'outline:none;';
 
+    // Сдвиг за прокрутку. transform создаёт у элемента свой слой, и z-index потомков
+    // (ручки-разделители, меню поверх соседней панели) перестаёт работать — поэтому при
+    // сверке раскладки сдвигаем только корень снимка, остальное ставит на место сверка.
     let tx = 0, ty = 0;
-    if (offset) { tx -= offset.x; ty -= offset.y; }
-    if (ctx.viewportFix && doc === document && cs.position === 'fixed') {
+    const lockOn = !!ctx.pairs;
+    if (offset && (!lockOn || (flags.isRoot && !flags.isFrameRoot))) { tx -= offset.x; ty -= offset.y; }
+    if (!lockOn && ctx.viewportFix && doc === document && cs.position === 'fixed') {
       tx += ctx.viewportFix.x; ty += ctx.viewportFix.y;
     }
     if (tx || ty) {
@@ -911,28 +919,77 @@
     return { frame, fdoc };
   }
 
-  // Ставит съехавшие элементы копии точно туда, где они в оригинале, сдвигом translate().
-  // Обход в порядке документа: сдвиг родителя уже учтён, дочерний элемент двигаем
-  // только на остаток. Возвращает число поправленных элементов.
+  const PX = /^-?\d*\.?\d+(?:e[-+]?\d+)?px$/i;
+  const round2 = (n) => +n.toFixed(2);
+
+  // Сдвигает элемент копии на (dx, dy), не создавая нового слоя отрисовки (в отличие от
+  // transform, при котором z-index потомков начинает действовать только внутри элемента).
+  // Возвращает 'pos' — сдвинут вместе со всем поддеревом; 'cb' — стал position:relative,
+  // и у absolute-потомков мог смениться отсчёт (их проверит следующий проход); null — не сдвинут.
+  function nudge(pair, dx, dy) {
+    const st = pair.el.style;
+    const pos = st.getPropertyValue('position') || 'static';
+    // Логические дубли (inset-block-*, inset-inline-*) при записи стиля в SVG встают после
+    // физических и перебивают новые left/top — убираем их, физические значения остаются.
+    const dropLogical = () => ['inset-block-start', 'inset-block-end', 'inset-inline-start', 'inset-inline-end']
+      .forEach((p) => st.removeProperty(p));
+    if (pair.rtl) {
+      const cur = st.getPropertyValue('transform');
+      st.setProperty('transform', `translate(${round2(dx)}px,${round2(dy)}px)` + (cur && cur !== 'none' ? ' ' + cur : ''));
+      return 'pos';
+    }
+    if (pos === 'static') {
+      dropLogical();
+      st.setProperty('position', 'relative');
+      st.setProperty('left', round2(dx) + 'px');
+      st.setProperty('top', round2(dy) + 'px');
+      st.setProperty('right', 'auto');
+      st.setProperty('bottom', 'auto');
+      return 'cb';
+    }
+    if (pos !== 'relative' && pos !== 'absolute' && pos !== 'fixed') return null;
+    // Для relative «auto» равно 0; для absolute/fixed «auto» — статическое место, его не знаем
+    const read = (p) => {
+      const v = st.getPropertyValue(p);
+      if (!v || v === 'auto') return pos === 'relative' ? 0 : null;
+      return PX.test(v) ? parseFloat(v) : null;
+    };
+    const L = read('left'), T = read('top');
+    if (L === null || T === null) return null;
+    dropLogical();
+    st.setProperty('left', round2(L + dx) + 'px');
+    st.setProperty('top', round2(T + dy) + 'px');
+    return 'pos';
+  }
+
+  // Ставит съехавшие элементы копии точно туда, где они в оригинале. Обход в порядке
+  // документа: сдвиг родителя уже учтён, дочерний элемент двигаем только на остаток.
+  // Если родитель стал position:relative, его потомков проверяем на следующем проходе,
+  // после новой раскладки. Возвращает число поправленных элементов.
   function alignToOriginal(pairs, expected) {
-    const actual = pairs.map((pair) => pair.el.getBoundingClientRect()); // одна раскладка на всех
-    const shift = new Array(pairs.length);
     const ZERO = { x: 0, y: 0 };
     let moved = 0;
-    for (let i = 0; i < pairs.length; i++) {
-      const pair = pairs[i];
-      const base = pair.parent >= 0 ? shift[pair.parent] : ZERO;
-      shift[i] = base;
-      const e = expected[i];
-      if (!e || !pair.movable || pair.parent < 0) continue;
-      const a = actual[i];
-      const dx = e.x - (a.left + base.x), dy = e.y - (a.top + base.y);
-      if (Math.abs(dx) < 0.75 && Math.abs(dy) < 0.75) continue;
-      const cur = pair.el.style.getPropertyValue('transform');
-      pair.el.style.setProperty('transform',
-        `translate(${+dx.toFixed(2)}px,${+dy.toFixed(2)}px)` + (cur && cur !== 'none' ? ' ' + cur : ''));
-      shift[i] = { x: base.x + dx, y: base.y + dy };
-      moved++;
+    for (let pass = 0; pass < 6; pass++) {
+      const actual = pairs.map((pair) => pair.el.getBoundingClientRect()); // одна раскладка на проход
+      const shift = new Array(pairs.length); // null — «пересчитать на следующем проходе»
+      let movedNow = 0;
+      for (let i = 0; i < pairs.length; i++) {
+        const pair = pairs[i];
+        const base = pair.parent >= 0 ? shift[pair.parent] : ZERO;
+        shift[i] = base;
+        if (!base) continue;
+        const e = expected[i];
+        if (!e || !pair.movable || pair.parent < 0) continue;
+        const a = actual[i];
+        const dx = e.x - (a.left + base.x), dy = e.y - (a.top + base.y);
+        if (Math.abs(dx) < 0.75 && Math.abs(dy) < 0.75) continue;
+        const how = nudge(pair, dx, dy);
+        if (!how) continue;
+        shift[i] = how === 'cb' ? null : { x: base.x + dx, y: base.y + dy };
+        movedNow++;
+      }
+      moved += movedNow;
+      if (!movedNow) break;
     }
     return moved;
   }
