@@ -12894,7 +12894,7 @@
   /* ======================= Запуск: скриншот -> PNG ======================= */
   // Можно переопределить без правки файла: window.SCREENSHOT_CONFIG = { mode: 'viewport' }
   var CONFIG = Object.assign({
-    mode: 'page',      // 'page' — вся страница целиком, 'viewport' — только видимая область
+    mode: 'viewport',  // 'viewport' — только то, что видно на экране; 'page' — вся страница целиком
     scale: null,       // null = devicePixelRatio (чётко на Retina); можно 1 или 2
     background: null   // null = фон страницы; или '#ffffff' / 'transparent'
   }, window.SCREENSHOT_CONFIG || {});
@@ -12945,8 +12945,12 @@
   var root = document.documentElement;
   var fullW = Math.max(root.scrollWidth, document.body ? document.body.scrollWidth : 0, innerWidth);
   var fullH = Math.max(root.scrollHeight, document.body ? document.body.scrollHeight : 0, innerHeight);
-  var w = CONFIG.mode === 'viewport' ? innerWidth : fullW;
-  var h = CONFIG.mode === 'viewport' ? innerHeight : fullH;
+  // Видимая область без полос прокрутки (в quirks-режиме окно — это body)
+  var quirks = document.compatMode === 'BackCompat' && document.body;
+  var viewW = Math.min((quirks ? document.body.clientWidth : root.clientWidth) || innerWidth, innerWidth);
+  var viewH = Math.min((quirks ? document.body.clientHeight : root.clientHeight) || innerHeight, innerHeight);
+  var w = CONFIG.mode === 'viewport' ? viewW : fullW;
+  var h = CONFIG.mode === 'viewport' ? viewH : fullH;
 
   // Уменьшаем scale, если итоговый canvas не влезает в лимиты браузера
   var scale = CONFIG.scale || window.devicePixelRatio || 1;
@@ -12959,8 +12963,10 @@
   };
   if (CONFIG.background !== null) opts.backgroundColor = CONFIG.background === 'transparent' ? null : CONFIG.background;
   if (CONFIG.mode === 'viewport') {
+    // Не догружаем lazy-картинки за экраном: это сдвигает раскладку страницы
+    opts.fixes = { lazyImages: false };
     opts.x = window.scrollX; opts.y = window.scrollY;
-    opts.width = innerWidth; opts.height = innerHeight;
+    opts.width = viewW; opts.height = viewH;
   } else {
     opts.width = fullW; opts.height = fullH;
   }

@@ -6,9 +6,9 @@
  * Обход идёт порциями и отдаёт управление браузеру, поэтому страница не зависает.
  *
  * Использование:
- *   1) Вставить в консоль — сразу скачает скриншот всей страницы.
+ *   1) Вставить в консоль — сразу скачает скриншот того, что видно на экране.
  *   2) <script src="inline.js" data-manual></script>, затем:
- *        await htmlShot.download({ fullPage: false });            // видимая область
+ *        await htmlShot.download({ fullPage: true });             // вся страница целиком
  *        await htmlShot.download({ target: document.querySelector('#app') });
  *        const canvas = await htmlShot.capture({ scale: 2 });
  *        const blob   = await htmlShot.toBlob({ type: 'image/jpeg', quality: 0.9 });
@@ -17,6 +17,9 @@
  *   htmlShot.diagnose() — найти элементы, которые в копии съехали, и показать, из-за каких стилей.
  *   await htmlShot.captureTab()  — захват вкладки (видит всё, но спросит разрешение; нужен клик).
  *   htmlShot.lastReport          — что не удалось встроить в последний снимок.
+ *
+ * Новое в v7.1: по умолчанию снимается только видимая область (fullPage: false), ровно
+ *   по размеру окна; страница не прокручивается, содержимое за экраном не трогается.
  *
  * Новое в v7 — раскладка как у html2canvas:
  *   • Сверка раскладки (lockLayout): копия раскладывается в скрытом iframe, каждый элемент
@@ -51,7 +54,7 @@
 
   const DEFAULTS = {
     target: null,             // элемент; по умолчанию вся страница
-    fullPage: true,           // true — вся страница, false — только видимая область
+    fullPage: false,          // false — только то, что видно на экране; true — вся страница
     scale: global.devicePixelRatio || 1,
     backgroundColor: null,    // null — взять фон страницы
     type: 'image/png',
@@ -801,8 +804,7 @@
         width = Math.max(de.scrollWidth, de.clientWidth);
         height = Math.max(de.scrollHeight, document.body ? document.body.scrollHeight : 0, de.clientHeight);
       } else {
-        width = de.clientWidth;
-        height = de.clientHeight;
+        ({ width, height } = viewportSize());
         ctx.viewportFix = { x: global.scrollX, y: global.scrollY };
         rootOffset = ctx.viewportFix;
       }
@@ -828,6 +830,18 @@
       root.insertBefore(st, root.firstChild);
     }
     return { root, ctx, width, height, isDoc, target };
+  }
+
+  /* ---------------- размер видимой области ---------------- */
+
+  // Видимая область без полос прокрутки. В quirks-режиме (нет <!DOCTYPE>) окном служит
+  // body, а documentElement.clientHeight там — высота всей страницы.
+  function viewportSize() {
+    const de = document.documentElement;
+    const quirks = document.compatMode === 'BackCompat' && document.body;
+    const w = (quirks ? document.body.clientWidth : de.clientWidth) || global.innerWidth;
+    const h = (quirks ? document.body.clientHeight : de.clientHeight) || global.innerHeight;
+    return { width: Math.min(w, global.innerWidth), height: Math.min(h, global.innerHeight) };
   }
 
   /* ---------------- сверка раскладки копии с оригиналом ---------------- */
@@ -902,7 +916,12 @@
     const undo = [];
     const sx = global.scrollX, sy = global.scrollY;
 
-    if (opts.contentVisibility) {
+    // Снимаем только экран — не трогаем то, что за его пределами: раскрытие
+    // content-visibility и догрузка lazy-картинок меняют высоту блоков выше экрана,
+    // и страница «уезжает» относительно того, что видит пользователь.
+    const offscreen = opts.fullPage || !!opts.target;
+
+    if (opts.contentVisibility && offscreen) {
       // content-visibility:auto не раскладывает содержимое вне экрана — размеры в копии были бы неверны
       const st = document.createElement('style');
       st.setAttribute('data-html-shot-ignore', '');
@@ -912,11 +931,19 @@
     }
 
     if (opts.lazyImages) {
-      for (const img of document.querySelectorAll('img[loading="lazy"]')) {
-        img.loading = 'eager';
-        undo.push(() => { img.loading = 'lazy'; });
+      if (offscreen) {
+        for (const img of document.querySelectorAll('img[loading="lazy"]')) {
+          img.loading = 'eager';
+          undo.push(() => { img.loading = 'lazy'; });
+        }
       }
-      const pending = [...document.images].filter((i) => !i.complete).map((i) => new Promise((r) => {
+      const vp = viewportSize();
+      const onScreen = (i) => {
+        if (offscreen) return true;
+        const r = i.getBoundingClientRect();
+        return r.bottom > 0 && r.right > 0 && r.top < vp.height && r.left < vp.width;
+      };
+      const pending = [...document.images].filter((i) => !i.complete && onScreen(i)).map((i) => new Promise((r) => {
         i.addEventListener('load', r, { once: true });
         i.addEventListener('error', r, { once: true });
       }));
@@ -1030,7 +1057,7 @@
         h2cOpts.width = Math.max(de.scrollWidth, de.clientWidth);
         h2cOpts.height = Math.max(de.scrollHeight, document.body ? document.body.scrollHeight : 0, de.clientHeight);
       } else {
-        Object.assign(h2cOpts, { x: global.scrollX, y: global.scrollY, width: de.clientWidth, height: de.clientHeight });
+        Object.assign(h2cOpts, { x: global.scrollX, y: global.scrollY }, viewportSize());
       }
       h2cOpts.scale = clampScale(h2cOpts.width, h2cOpts.height, opts.scale);
     }
@@ -1395,7 +1422,7 @@
     const run = () => {
       console.log('[htmlShot] v7: делаю скриншот…');
       console.time('[htmlShot]');
-      // Настройки без правки файла: window.HTML_SHOT_CONFIG = { fullPage: false, method: 'tab' }
+      // Настройки без правки файла: window.HTML_SHOT_CONFIG = { fullPage: true, method: 'tab' }
       api.download(global.HTML_SHOT_CONFIG || {})
         .then(() => console.timeEnd('[htmlShot]'))
         .catch((e) => console.error('[htmlShot]', e));
