@@ -1,58 +1,20 @@
 /*!
- * inline.js v7 — скриншот страницы без разрешений браузера.
- * Принцип: обходим DOM (включая Shadow DOM и same-origin iframe), копируем вычисленные
- * стили в inline-style, встраиваем картинки/шрифты/фоны как data:URL, собираем всё в
- * SVG <foreignObject>, рисуем на <canvas> и сохраняем PNG/JPEG/WebP.
- * Обход идёт порциями и отдаёт управление браузеру, поэтому страница не зависает.
+ * inline.js v7.4 — скриншот страницы без разрешений браузера.
+ * Копирует страницу (включая Shadow DOM и same-origin iframe) с вычисленными стилями,
+ * встраивает картинки, шрифты и фоны, рисует через SVG <foreignObject> в <canvas>
+ * и сохраняет PNG. Раскладка копии сверяется с оригиналом, элементы стоят на своих местах.
  *
  * Использование:
  *   1) Вставить в консоль — сразу скачает скриншот того, что видно на экране.
  *   2) <script src="inline.js" data-manual></script>, затем:
+ *        await htmlShot.download();                               // видимая область
  *        await htmlShot.download({ fullPage: true });             // вся страница целиком
  *        await htmlShot.download({ target: document.querySelector('#app') });
  *        const canvas = await htmlShot.capture({ scale: 2 });
  *        const blob   = await htmlShot.toBlob({ type: 'image/jpeg', quality: 0.9 });
+ *        await htmlShot.captureTab();                             // захват вкладки (нужен клик)
+ *   Настройки до вставки в консоль: window.HTML_SHOT_CONFIG = { fullPage: true, ... }
  *   Элементы с атрибутом data-html-shot-ignore не попадают в скриншот.
- *   htmlShot.download({ debug: true }) — открыть копию в новой вкладке для инспекции.
- *   htmlShot.inspect('селектор') — почему конкретного элемента нет на снимке (текст отчёта — в консоль).
- *   htmlShot.diagnose() — найти элементы, которые в копии съехали, и показать, из-за каких стилей.
- *   await htmlShot.captureTab()  — захват вкладки (видит всё, но спросит разрешение; нужен клик).
- *   htmlShot.lastReport          — что не удалось встроить в последний снимок.
- *
- * Новое в v7.4: блоки за краем с absolute/transform-содержимым (ручки-разделители) больше не
- *   выкидываются; htmlShot.inspect(селектор) — разбор, почему элемента нет на снимке.
- *
- * Новое в v7.3: элементы ставятся на место через left/top, а не transform — ручки-разделители
- *   и другие элементы с z-index поверх соседних панелей больше не пропадают.
- *
- * Новое в v7.2: содержимое iframe (например, график TradingView) — absolute/fixed элементы
- *   внутри фрейма больше не улетают к углу снимка, сверка раскладки работает и внутри фреймов.
- *
- * Новое в v7.1: по умолчанию снимается только видимая область (fullPage: false), ровно
- *   по размеру окна; страница не прокручивается, содержимое за экраном не трогается.
- *
- * Новое в v7 — раскладка как у html2canvas:
- *   • Сверка раскладки (lockLayout): копия раскладывается в скрытом iframe, каждый элемент
- *     сравнивается с оригиналом, и съехавшие ставятся точно на своё место (translate).
- *     Центрированное больше не «прилипает» влево, sticky/fixed стоят там, где их видно.
- *   • sticky внутри прокручиваемых блоков и страницы (шапки таблиц, хедеры) больше не пропадают.
- *   • Не выкидываются видимые элементы: absolute/fixed (меню, подсказки), вылезающие за
- *     overflow предка, и строки, внутри которых есть «прилипший» элемент.
- *   Отключить: window.HTML_SHOT_CONFIG = { lockLayout: false }.
- *
- * Новое в v6:
- *   • Загрузчик ресурсов: не больше N запросов одновременно, свои куки для своего сайта,
- *     повтор в обход кэша (картинка могла закэшироваться без CORS-заголовков, когда её
- *     грузил <img>), прокси ('https://p/?url=' или 'https://p/?u={url}' или функция).
- *   • Отчёт: список картинок/шрифтов, которые браузер не отдал (CORS), в консоли и в toast.
- *   • Шрифты, подключённые через JS (new FontFace), тоже встраиваются.
- *   • loading="lazy" картинки догружаются до снимка, content-visibility:auto раскрывается —
- *     раскладка в копии совпадает с настоящей.
- *   • Анимации ставятся на паузу на время обхода — снимок согласованный, а не «рваный».
- *   • Проверка, что canvas читается (иначе toBlob упал бы уже при сохранении).
- *   • Если SVG-рендер не удался (например, Safari «заражает» canvas) — пробует html2canvas,
- *     если он есть на странице, и предлагает захват вкладки.
- *   • Имя файла: сайт_дата_время.png. Настройки до вставки: window.HTML_SHOT_CONFIG = {...}
  */
 (function (global) {
   'use strict';
@@ -77,7 +39,6 @@
     placeholder: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
     filter: null,             // (element) => false, чтобы исключить элемент
     frameBudget: 12,          // мс непрерывной работы, после которых отдаём управление браузеру
-    debug: false,
     lazyImages: true,         // догрузить loading="lazy" картинки до снимка
     freezeAnimations: true,   // пауза анимаций на время обхода
     contentVisibility: true,  // раскрыть content-visibility:auto на время снимка
@@ -602,7 +563,6 @@
     }
     const el = ctx.doc.createElementNS(ns, cloneTag);
     copyAttributes(node, el, cloneTag !== tag);
-    const inFixed = !!flags.inFixed || cs.position === 'fixed';
     let pairIdx = -1;
     // Элемент без «чистого» сдвига (scale/rotate/zoom): поправки для его потомков
     // пришлось бы пересчитывать через матрицу — их не двигаем.
@@ -610,8 +570,8 @@
       (cs.scale || 'none') !== 'none' || (cs.rotate || 'none') !== 'none' || (cs.zoom && cs.zoom !== '1');
     if (ctx.pairs) {
       pairIdx = ctx.pairs.push({
-        node, el, parent: flags.pIdx === undefined ? -1 : flags.pIdx, inFixed, frame: flags.frame || null,
-        rtl: cs.direction === 'rtl', culled: false,
+        node, el, parent: flags.pIdx === undefined ? -1 : flags.pIdx, frame: flags.frame || null,
+        rtl: cs.direction === 'rtl',
         movable: isHTML && !flags.warped && canTranslate(cloneTag, cs.display),
       }) - 1;
     }
@@ -663,7 +623,7 @@
     }
     setStyle(el, style, doc.baseURI, ctx);
 
-    if (culled) { if (pairIdx >= 0) ctx.pairs[pairIdx].culled = true; return el; }
+    if (culled) return el;
 
     // Псевдоэлементы ::before / ::after
     if (isHTML && !NO_CHILDREN.has(tag)) {
@@ -766,7 +726,7 @@
       const d = cs.display;
       const dropBelow = isHTML && (d === 'block' || d === 'flow-root' || d === 'list-item' ||
         (d === 'flex' && cs.flexDirection === 'column' && /^(normal|flex-start|start)$/.test(cs.justifyContent)));
-      const childFlags = { dropBelow, inFixed, pIdx: pairIdx >= 0 ? pairIdx : flags.pIdx, warped: !!flags.warped || warps, frame: flags.frame };
+      const childFlags = { dropBelow, pIdx: pairIdx >= 0 ? pairIdx : flags.pIdx, warped: !!flags.warped || warps, frame: flags.frame };
       for (const k of childNodesOf(node)) {
         const c = await cloneNode(k, ctx, vals, scrolled, childFlags, childClip);
         if (c) el.appendChild(c);
@@ -1105,8 +1065,8 @@
         ctx.moved = alignToOriginal(ctx.pairs, expected);
         await breathe(ctx);
         xml = new XMLSerializer().serializeToString(root);
-      } catch (e) {
-        console.warn('[htmlShot] сверка раскладки не удалась, снимаю без неё:', e);
+      } catch (_) {
+        // сверка не удалась — снимаем без неё
       } finally {
         if (frame) frame.remove();
       }
@@ -1115,13 +1075,6 @@
     await breathe(ctx);
     const svg = `<svg xmlns="${SVGNS}" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">` +
       `<foreignObject x="0" y="0" width="100%" height="100%">${xml}</foreignObject></svg>`;
-
-    if (opts.debug) {
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml' }));
-      a.target = '_blank';
-      a.click();
-    }
 
     // Только data:URL: SVG с <foreignObject>, загруженный через blob:, Chrome считает
     // «чужим» и запрещает читать canvas (проверено).
@@ -1169,7 +1122,6 @@
       ({ canvas, ctx } = await captureSvg(opts));
     } catch (err) {
       if (!(opts.fallbackHtml2canvas && typeof global.html2canvas === 'function')) throw err;
-      console.warn('[htmlShot] SVG-рендер не удался, пробую html2canvas:', err);
       canvas = await captureHtml2canvas(opts);
       engine = 'html2canvas';
     } finally {
@@ -1284,16 +1236,6 @@
     return parts.join(';\n');
   }
 
-  function logReport(report) {
-    if (!report.problems) return;
-    console.groupCollapsed(`[htmlShot] Не всё удалось встроить (${report.problems}) — список`);
-    if (report.failed.length) console.table(report.failed);
-    if (report.missingFonts.length) console.log('Шрифты (FontFace API) без найденного файла:', report.missingFonts);
-    if (report.taintedCanvases) console.log('Заражённых <canvas>:', report.taintedCanvases);
-    console.log('Что делать: corsProxy, либо htmlShot.captureTab() — захват вкладки видит всё.');
-    console.groupEnd();
-  }
-
   function offerTab(text, kind, opts) {
     return new Promise((resolve, reject) => {
       toast(text, kind || 'info', [
@@ -1347,14 +1289,13 @@
     const name = opts.filename || autoFilename(opts.type);
     saveBlob(blob, name);
     const report = canvas.htmlShotReport;
-    logReport(report);
     if (opts.ui) {
       const head = `✅ Сохранено: ${name}\n${Math.round(blob.size / 1024)} КБ, ${((performance.now() - t0) / 1000).toFixed(1)} с` +
         (report.engine !== 'svg' ? ` (${report.engine})` : '');
       if (report.problems && opts.method === 'auto' && !opts.target) {
-        offerTab(head + '\n⚠️ ' + describeProblems(report) + '.\nСписок — в консоли. Захват вкладки снимет всё как на экране.', 'warn', opts).catch(() => {});
+        offerTab(head + '\n⚠️ ' + describeProblems(report) + '.\nЗахват вкладки снимет всё как на экране.', 'warn', opts).catch(() => {});
       } else if (report.problems) {
-        toast(head + '\n⚠️ ' + describeProblems(report) + '. Список — в консоли.', 'warn', null, 8000);
+        toast(head + '\n⚠️ ' + describeProblems(report) + '.', 'warn', null, 8000);
       } else {
         toast(head, 'ok', null, 4000);
       }
@@ -1430,7 +1371,7 @@
       const pageH = () => Math.max(de.scrollHeight, document.body ? document.body.scrollHeight : 0, vh);
       let total = pageH();
       const maxH = Math.floor(Math.min(32767, 268435456 / video.videoWidth) / k);
-      if (total > maxH) { console.warn('[htmlShot] страница обрезана до', maxH, 'px (лимит canvas)'); total = maxH; }
+      if (total > maxH) total = maxH; // лимит размера canvas
       const out = document.createElement('canvas');
       out.width = video.videoWidth;
       out.height = Math.round(total * k);
@@ -1453,171 +1394,15 @@
     }
   }
 
-  /* ---------------- диагностика ---------------- */
-
-  const DIAG_PROPS = ['display', 'position', 'width', 'max-width', 'margin-left', 'margin-right', 'left', 'right',
-    'transform', 'translate', 'justify-content', 'justify-self', 'align-items', 'text-align', 'flex', 'grid-template-columns', 'zoom'];
-
-  // Раскладывает копию в скрытом iframe и ищет элементы, которые съехали относительно оригинала.
-  // Выводит «первопричины» — элементы, у которых родитель на месте, а сами они сдвинуты.
-  async function diagnose(userOpts = {}) {
-    // Показывает расхождения ДО сверки (lockLayout) — то, что она исправляет при снимке
-    const opts = Object.assign({}, DEFAULTS, userOpts, { embedFonts: false });
-    const { root, ctx, width, height, isDoc, target } = await buildClone(opts, true);
-    const expected = expectedPositions(ctx.pairs, opts, isDoc, target);
-    let frame = null;
-    try {
-      ({ frame } = await layoutInFrame(root, width, height, opts));
-      const bad = new Array(ctx.pairs.length).fill(false);
-      const causes = [];
-      ctx.pairs.forEach((pair, i) => {
-        if (pair.parent < 0) return; // корень: у копии намеренно другая высота
-        if (!pair.node.isConnected || !pair.el.getBoundingClientRect) return;
-        const o = expected[i];
-        const c = pair.el.getBoundingClientRect();
-        if (!o) return;
-        const dx = c.left - o.x, dy = c.top - o.y, dw = c.width - o.w, dh = c.height - o.h;
-        bad[i] = Math.abs(dx) > 2 || Math.abs(dw) > 2 || Math.abs(dy) > 2 || Math.abs(dh) > 2;
-        if (bad[i] && (pair.parent < 0 || !bad[pair.parent])) {
-          const ocs = getComputedStyle(pair.node);
-          const inline = pair.el.getAttribute('style') || '';
-          const styles = {};
-          for (const p of DIAG_PROPS) {
-            const m = inline.match(new RegExp('(?:^|;)' + p + ':([^;]*)'));
-            styles[p] = { оригинал: ocs.getPropertyValue(p), копия: m ? m[1] : '(по умолчанию)' };
-          }
-          causes.push({ element: pair.node, dx: Math.round(dx), dy: Math.round(dy), dw: Math.round(dw), dh: Math.round(dh), styles });
-        }
-      });
-
-      if (!causes.length) {
-        console.log('[htmlShot] Все элементы копии стоят на своих местах.');
-      } else {
-        console.log(`[htmlShot] Съехавших элементов (первопричин): ${causes.length}. Первые 10:`);
-        for (const c of causes.slice(0, 10)) {
-          console.groupCollapsed(`сдвиг x:${c.dx} y:${c.dy}, размер w:${c.dw} h:${c.dh}`, c.element);
-          console.log(c.element);
-          console.table(c.styles);
-          console.groupEnd();
-        }
-      }
-      return causes;
-    } finally {
-      if (frame) frame.remove();
-      cleanupSandbox();
-    }
-  }
-
-  // Разбор одного элемента, которого нет на снимке: попал ли он в копию, где стоит,
-  // и кто его перекрывает. Текст отчёта печатается в консоль — его можно скопировать целиком.
-  //   htmlShot.inspect('[data-sentry-component="ResizeHandleBar"]')
-  const STACK_PROPS = ['position', 'z-index', 'display', 'width', 'height', 'left', 'top', 'overflow', 'opacity',
-    'transform', 'filter', 'isolation', 'contain', 'will-change', 'mix-blend-mode', 'background-color', 'visibility'];
-
-  function describeEl(el) {
-    if (!el) return '(ничего)';
-    if (el.nodeType !== 1) return '#text';
-    const cls = typeof el.className === 'string' ? el.className.trim().split(/\s+/).slice(0, 4).join('.') : '';
-    const sentry = el.getAttribute && el.getAttribute('data-sentry-component');
-    return el.localName + (el.id ? '#' + el.id : '') + (cls ? '.' + cls : '') + (sentry ? ` [${sentry}]` : '');
-  }
-
-  function propsLine(cs) {
-    return STACK_PROPS.map((p) => {
-      const v = cs.getPropertyValue(p);
-      return v && v !== 'auto' && v !== 'none' && v !== 'normal' && v !== 'visible' && v !== '1' && v !== 'static' ? `${p}:${v}` : '';
-    }).filter(Boolean).join('; ');
-  }
-
-  async function inspect(target, userOpts = {}) {
-    const node = typeof target === 'string' ? document.querySelector(target) : target;
-    if (!node) { console.warn('[htmlShot] inspect: элемент не найден:', target); return null; }
-    const opts = Object.assign({}, DEFAULTS, userOpts);
-    const lines = [];
-    const log = (s) => lines.push(s);
-    const restore = await preparePage(opts);
-    let frame = null;
-    try {
-      const built = await buildClone(opts, true);
-      const { root, ctx, width, height, isDoc } = built;
-      const pairs = ctx.pairs;
-      const expected = expectedPositions(pairs, opts, isDoc, built.target);
-      ({ frame } = await layoutInFrame(root, width, height, opts));
-      alignToOriginal(pairs, expected);
-      const fdoc = frame.contentDocument;
-      const byCopy = new Map(pairs.map((p) => [p.el, p.node]));
-      const origOf = (c) => { for (let e = c; e; e = e.parentElement) if (byCopy.has(e)) return byCopy.get(e); return null; };
-
-      const r = node.getBoundingClientRect();
-      log(`htmlShot v${api.version} inspect: ${describeEl(node)}`);
-      log(`снимок ${width}x${height}, fullPage:${opts.fullPage}, scroll ${global.scrollX},${global.scrollY}, окно ${global.innerWidth}x${global.innerHeight}`);
-      log(`оригинал: x ${r.left.toFixed(1)} y ${r.top.toFixed(1)} ${r.width.toFixed(1)}x${r.height.toFixed(1)}`);
-      const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
-      const topOrig = document.elementFromPoint(cx, cy);
-      log(`сверху в оригинале (центр элемента): ${describeEl(topOrig)}`);
-
-      const idx = pairs.findIndex((p) => p.node === node);
-      if (idx < 0) {
-        log('В КОПИЮ НЕ ПОПАЛ. Цепочка предков:');
-        for (let a = node.parentElement; a; a = a.parentElement) {
-          const pi = pairs.findIndex((p) => p.node === a);
-          log(`  ${describeEl(a)} — ${pi < 0 ? 'нет в копии' : pairs[pi].culled ? 'в копии, НО СОДЕРЖИМОЕ ВЫКИНУТО (за краем)' : 'в копии'}`);
-          if (pi >= 0) break;
-        }
-      } else {
-        const pair = pairs[idx];
-        const c = pair.el.getBoundingClientRect();
-        const e = expected[idx];
-        log(`копия:    x ${c.left.toFixed(1)} y ${c.top.toFixed(1)} ${c.width.toFixed(1)}x${c.height.toFixed(1)}` +
-          (e ? `  (должен быть x ${e.x.toFixed(1)} y ${e.y.toFixed(1)})` : '') + (pair.culled ? '  СОДЕРЖИМОЕ ВЫКИНУТО' : ''));
-        const hit = fdoc.elementFromPoint(c.left + c.width / 2, c.top + c.height / 2);
-        const hitOrig = origOf(hit);
-        log(`сверху в копии (центр элемента): ${describeEl(hitOrig)}${hit && hit.localName === 'html2canvaspseudoelement' ? ' (псевдоэлемент)' : ''}` +
-          (hitOrig === node || (hitOrig && node.contains(hitOrig)) ? '  — элемент виден' : '  — ЭЛЕМЕНТ ПЕРЕКРЫТ'));
-        log('Цепочка (оригинал | копия):');
-        const fwin = fdoc.defaultView;
-        for (let i = idx, depth = 0; i >= 0 && depth < 12; i = pairs[i].parent, depth++) {
-          const p = pairs[i];
-          const oc = p.node.ownerDocument.defaultView.getComputedStyle(p.node);
-          let cc = null;
-          try { cc = fwin.getComputedStyle(p.el); } catch (_) {}
-          log(`  ${describeEl(p.node)}`);
-          log(`    оригинал: ${propsLine(oc)}`);
-          log(`    копия:    ${cc ? propsLine(cc) : '?'}`);
-        }
-        if (hitOrig && hitOrig !== node && !node.contains(hitOrig)) {
-          log(`Перекрывающий элемент и его предки:`);
-          const hi = pairs.findIndex((p) => p.node === hitOrig);
-          for (let i = hi, depth = 0; i >= 0 && depth < 8; i = pairs[i].parent, depth++) {
-            const p = pairs[i];
-            let cc = null;
-            try { cc = fwin.getComputedStyle(p.el); } catch (_) {}
-            log(`  ${describeEl(p.node)} | копия: ${cc ? propsLine(cc) : '?'}`);
-          }
-        }
-      }
-    } finally {
-      if (frame) frame.remove();
-      restore();
-      cleanupSandbox();
-    }
-    const text = lines.join('\n');
-    console.log(text);
-    return text;
-  }
-
-  const api = { version: '7.4', capture, toBlob, toDataURL: toDataURLApi, download, captureTab, diagnose, inspect, defaults: DEFAULTS, lastReport: null };
+  const api = { version: '7.4', capture, toBlob, toDataURL: toDataURLApi, download, captureTab, defaults: DEFAULTS, lastReport: null };
   global.htmlShot = api;
 
   // Автозапуск (если вставили в консоль или подключили без data-manual)
   if (!(currentScript && currentScript.hasAttribute('data-manual'))) {
     const run = () => {
-      console.log('[htmlShot] v7.4: делаю скриншот…');
-      console.time('[htmlShot]');
       // Настройки без правки файла: window.HTML_SHOT_CONFIG = { fullPage: true, method: 'tab' }
       api.download(global.HTML_SHOT_CONFIG || {})
-        .then(() => console.timeEnd('[htmlShot]'))
-        .catch((e) => console.error('[htmlShot]', e));
+        .catch(() => { /* ошибка уже показана в уведомлении */ });
     };
     document.readyState === 'complete' ? run() : global.addEventListener('load', run, { once: true });
   }
