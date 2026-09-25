@@ -1,5 +1,5 @@
 /*!
- * inline.js v6 — скриншот страницы без разрешений браузера.
+ * inline.js v7 — скриншот страницы без разрешений браузера.
  * Принцип: обходим DOM (включая Shadow DOM и same-origin iframe), копируем вычисленные
  * стили в inline-style, встраиваем картинки/шрифты/фоны как data:URL, собираем всё в
  * SVG <foreignObject>, рисуем на <canvas> и сохраняем PNG/JPEG/WebP.
@@ -17,6 +17,15 @@
  *   htmlShot.diagnose() — найти элементы, которые в копии съехали, и показать, из-за каких стилей.
  *   await htmlShot.captureTab()  — захват вкладки (видит всё, но спросит разрешение; нужен клик).
  *   htmlShot.lastReport          — что не удалось встроить в последний снимок.
+ *
+ * Новое в v7 — раскладка как у html2canvas:
+ *   • Сверка раскладки (lockLayout): копия раскладывается в скрытом iframe, каждый элемент
+ *     сравнивается с оригиналом, и съехавшие ставятся точно на своё место (translate).
+ *     Центрированное больше не «прилипает» влево, sticky/fixed стоят там, где их видно.
+ *   • sticky внутри прокручиваемых блоков и страницы (шапки таблиц, хедеры) больше не пропадают.
+ *   • Не выкидываются видимые элементы: absolute/fixed (меню, подсказки), вылезающие за
+ *     overflow предка, и строки, внутри которых есть «прилипший» элемент.
+ *   Отключить: window.HTML_SHOT_CONFIG = { lockLayout: false }.
  *
  * Новое в v6:
  *   • Загрузчик ресурсов: не больше N запросов одновременно, свои куки для своего сайта,
@@ -62,6 +71,7 @@
     jsFonts: true,            // встраивать шрифты, добавленные через FontFace API
     fallbackHtml2canvas: true,// если SVG-рендер не удался и на странице есть window.html2canvas
     method: 'auto',           // download(): 'auto' | 'dom' | 'tab' (захват вкладки)
+    lockLayout: true,         // сверить копию с оригиналом и поставить съехавшие элементы на место
     ui: true,                 // всплывающие уведомления при download()
   };
 
@@ -505,6 +515,27 @@
     right: Math.min(r.right, c ? c.right : Infinity), bottom: Math.min(r.bottom, c ? c.bottom : Infinity),
   });
 
+  const REPLACED = new Set(['img', 'canvas', 'video', 'iframe', 'input', 'textarea', 'select', 'svg', 'object', 'embed']);
+  // transform действует не на всё: не на обычные inline и не на строки/группы таблиц
+  function canTranslate(tag, display) {
+    if (display === 'contents' || display === 'none') return false;
+    if (display === 'inline') return REPLACED.has(tag);
+    if (display.startsWith('table-')) return display === 'table-cell' || display === 'table-caption';
+    return true;
+  }
+
+  // Строка/группа, прокрученная за край, может держать внутри «прилипший» элемент
+  // (шапка таблицы, заголовок группы) — он виден, выкидывать такое поддерево нельзя.
+  // Большие поддеревья не проверяем до конца и считаем, что sticky там может быть.
+  function hasStickyInside(node, win) {
+    const it = node.ownerDocument.createTreeWalker(node, NodeFilter.SHOW_ELEMENT);
+    for (let n = it.nextNode(), budget = 300; n; n = it.nextNode()) {
+      if (--budget < 0) return true;
+      if (win.getComputedStyle(n).position === 'sticky') return true;
+    }
+    return false;
+  }
+
   async function cloneNode(node, ctx, parentVals, offset, flags = {}, clip = null) {
     if (node.nodeType === 3) {
       addChars(node.data, ctx);
@@ -534,12 +565,17 @@
     // Элемент целиком вне видимой области своего обрезающего предка: оставляем «коробку»
     // (размеры уже зафиксированы в стилях, раскладка не поедет), но не клонируем содержимое.
     // Если он ниже видимой области в обычном потоке — он ни на что не влияет, выкидываем совсем.
+    // absolute/fixed не трогаем: они часто вылезают за overflow предка и остаются видимыми
+    // (выпадающие меню, подсказки, бейджи). Выкидываем только то, что не сдвинуто
+    // transform/relative-смещением — иначе «под экраном» может оказаться видимый элемент.
     let rect = null, culled = false;
-    if (clip && isHTML && !flags.isRoot && cs.position !== 'fixed' && BLOCKISH.test(cs.display)) {
+    const inFlow = cs.position === 'static' || cs.position === 'relative' || cs.position === 'sticky';
+    if (clip && isHTML && !flags.isRoot && inFlow && BLOCKISH.test(cs.display)) {
       rect = node.getBoundingClientRect();
-      culled = !intersects(rect, clip);
-      if (culled && flags.dropBelow && rect.top >= clip.bottom &&
-          (cs.position === 'static' || cs.position === 'relative')) return null;
+      culled = !intersects(rect, clip) && !hasStickyInside(node, win);
+      const untransformed = cs.transform === 'none' && (cs.translate || 'none') === 'none';
+      if (culled && flags.dropBelow && rect.top >= clip.bottom && untransformed &&
+          (cs.position === 'static' || (cs.position === 'relative' && /^(auto|0px)$/.test(cs.top)))) return null;
     }
     const vals = readValues(cs);
 
@@ -553,8 +589,15 @@
     copyAttributes(node, el, cloneTag !== tag);
     const inFixed = !!flags.inFixed || cs.position === 'fixed';
     let pairIdx = -1;
+    // Элемент без «чистого» сдвига (scale/rotate/zoom): поправки для его потомков
+    // пришлось бы пересчитывать через матрицу — их не двигаем.
+    const warps = cs.transform !== 'none' && !/^matrix\(1, 0, 0, 1, /.test(cs.transform) ||
+      (cs.scale || 'none') !== 'none' || (cs.rotate || 'none') !== 'none' || (cs.zoom && cs.zoom !== '1');
     if (ctx.pairs && doc === document) {
-      pairIdx = ctx.pairs.push({ node, el, parent: flags.pIdx === undefined ? -1 : flags.pIdx, inFixed }) - 1;
+      pairIdx = ctx.pairs.push({
+        node, el, parent: flags.pIdx === undefined ? -1 : flags.pIdx, inFixed,
+        movable: isHTML && !flags.warped && canTranslate(cloneTag, cs.display),
+      }) - 1;
     }
 
     // Корень документа внутри iframe не должен ничего наследовать от внешней страницы — пишем все свойства
@@ -580,6 +623,11 @@
                `overflow-y:${isScrollable(cs.overflowY) ? 'hidden' : cs.overflowY};`;
       const borders = (parseFloat(cs.borderLeftWidth) || 0) + (parseFloat(cs.borderRightWidth) || 0);
       style += node.offsetWidth - node.clientWidth - borders > 0 ? 'scrollbar-gutter:stable;' : 'scrollbar-width:none;';
+    }
+    // sticky внутри <foreignObject> ведёт себя не так, как на странице (прокрутки там нет):
+    // ставим элемент в обычный поток, а на «прилипшее» место его переносит сверка раскладки.
+    if (ctx.pairs && cs.position === 'sticky' && doc === document) {
+      style += 'position:relative;top:auto;right:auto;bottom:auto;left:auto;';
     }
     if (tag === 'textarea') style += 'resize:none;';
     if (node === doc.activeElement && !isDocRoot) style += 'outline:none;';
@@ -677,14 +725,15 @@
     if (!(isHTML && NO_CHILDREN.has(tag))) {
       const scrolled = isHTML && !isDocRoot && (node.scrollLeft || node.scrollTop)
         ? { x: node.scrollLeft, y: node.scrollTop } : null;
-      let childClip = clip;
+      // Потомки absolute/fixed могут быть видны за пределами обрезающего предка
+      let childClip = cs.position === 'absolute' || cs.position === 'fixed' ? null : clip;
       if (isHTML && !isDocRoot && (cs.overflowX !== 'visible' || cs.overflowY !== 'visible') && cs.display !== 'contents') {
         childClip = clipTo(rect || node.getBoundingClientRect(), clip);
       }
       const d = cs.display;
       const dropBelow = isHTML && (d === 'block' || d === 'flow-root' || d === 'list-item' ||
         (d === 'flex' && cs.flexDirection === 'column' && /^(normal|flex-start|start)$/.test(cs.justifyContent)));
-      const childFlags = { dropBelow, inFixed, pIdx: pairIdx >= 0 ? pairIdx : flags.pIdx };
+      const childFlags = { dropBelow, inFixed, pIdx: pairIdx >= 0 ? pairIdx : flags.pIdx, warped: !!flags.warped || warps };
       for (const k of childNodesOf(node)) {
         const c = await cloneNode(k, ctx, vals, scrolled, childFlags, childClip);
         if (c) el.appendChild(c);
@@ -741,7 +790,7 @@
       fonts: new Set(), fontStrings: new Set(), chars: new Set(),
       pseudo: [], tasks: [], refIds: new Set(), extraDefs: [], extraIds: new Set(),
       sprites: new Map(), uid: 0, viewportFix: null, height: 0, lastYield: performance.now(),
-      missingFonts: new Set(), taintedCanvases: 0,
+      missingFonts: new Set(), taintedCanvases: 0, moved: 0,
       pairs: withPairs ? [] : null,
     };
 
@@ -779,6 +828,68 @@
       root.insertBefore(st, root.firstChild);
     }
     return { root, ctx, width, height, isDoc, target };
+  }
+
+  /* ---------------- сверка раскладки копии с оригиналом ---------------- */
+
+  // Где каждый элемент стоит в оригинале — в координатах снимка. Как у html2canvas:
+  // fixed/sticky там, где их видно при текущей прокрутке.
+  function expectedPositions(pairs, opts, isDoc, target) {
+    const tRect = !isDoc ? target.getBoundingClientRect() : null;
+    const sx = global.scrollX, sy = global.scrollY;
+    return pairs.map((pair) => {
+      if (!pair.node.isConnected) return null;
+      const r = pair.node.getBoundingClientRect();
+      if (!r.width && !r.height) return null;
+      let x = r.left, y = r.top;
+      if (tRect) { x -= tRect.left; y -= tRect.top; }
+      else if (opts.fullPage) { x += sx; y += sy; }
+      return { x, y, w: r.width, h: r.height };
+    });
+  }
+
+  // Раскладывает копию в скрытом iframe размером со снимок (как в <foreignObject>).
+  async function layoutInFrame(root, width, height, opts) {
+    const frame = document.createElement('iframe');
+    frame.setAttribute('data-html-shot-ignore', '');
+    frame.setAttribute('aria-hidden', 'true');
+    frame.style.cssText = `position:fixed;left:0;top:0;width:${width}px;height:${height}px;border:0;` +
+      'visibility:hidden;pointer-events:none;z-index:-2147483647';
+    (document.body || document.documentElement).appendChild(frame);
+    const fdoc = frame.contentDocument;
+    try { fdoc.open(); fdoc.write('<!DOCTYPE html><html><head></head><body></body></html>'); fdoc.close(); } catch (_) {}
+    fdoc.documentElement.style.cssText = 'margin:0;padding:0;overflow:hidden';
+    fdoc.body.style.cssText = 'margin:0;padding:0';
+    fdoc.body.appendChild(fdoc.adoptNode(root));
+    void fdoc.body.offsetHeight; // запустить загрузку встроенных шрифтов
+    if (fdoc.fonts && fdoc.fonts.ready) await Promise.race([fdoc.fonts.ready, sleep(opts.timeout)]);
+    return { frame, fdoc };
+  }
+
+  // Ставит съехавшие элементы копии точно туда, где они в оригинале, сдвигом translate().
+  // Обход в порядке документа: сдвиг родителя уже учтён, дочерний элемент двигаем
+  // только на остаток. Возвращает число поправленных элементов.
+  function alignToOriginal(pairs, expected) {
+    const actual = pairs.map((pair) => pair.el.getBoundingClientRect()); // одна раскладка на всех
+    const shift = new Array(pairs.length);
+    const ZERO = { x: 0, y: 0 };
+    let moved = 0;
+    for (let i = 0; i < pairs.length; i++) {
+      const pair = pairs[i];
+      const base = pair.parent >= 0 ? shift[pair.parent] : ZERO;
+      shift[i] = base;
+      const e = expected[i];
+      if (!e || !pair.movable || pair.parent < 0) continue;
+      const a = actual[i];
+      const dx = e.x - (a.left + base.x), dy = e.y - (a.top + base.y);
+      if (Math.abs(dx) < 0.75 && Math.abs(dy) < 0.75) continue;
+      const cur = pair.el.style.getPropertyValue('transform');
+      pair.el.style.setProperty('transform',
+        `translate(${+dx.toFixed(2)}px,${+dy.toFixed(2)}px)` + (cur && cur !== 'none' ? ' ' + cur : ''));
+      shift[i] = { x: base.x + dx, y: base.y + dy };
+      moved++;
+    }
+    return moved;
   }
 
   /* ---------------- подготовка страницы ---------------- */
@@ -861,9 +972,25 @@
   }
 
   async function captureSvg(opts) {
-    const { root, ctx, width, height, isDoc } = await buildClone(opts, false);
+    const { root, ctx, width, height, isDoc, target } = await buildClone(opts, opts.lockLayout);
     await breathe(ctx);
-    const xml = new XMLSerializer().serializeToString(root);
+    let xml;
+    if (opts.lockLayout && ctx.pairs.length) {
+      // Позиции оригинала снимаем до того, как на странице появится iframe
+      const expected = expectedPositions(ctx.pairs, opts, isDoc, target);
+      let frame = null;
+      try {
+        ({ frame } = await layoutInFrame(root, width, height, opts));
+        ctx.moved = alignToOriginal(ctx.pairs, expected);
+        await breathe(ctx);
+        xml = new XMLSerializer().serializeToString(root);
+      } catch (e) {
+        console.warn('[htmlShot] сверка раскладки не удалась, снимаю без неё:', e);
+      } finally {
+        if (frame) frame.remove();
+      }
+    }
+    if (xml === undefined) xml = new XMLSerializer().serializeToString(root);
     await breathe(ctx);
     const svg = `<svg xmlns="${SVGNS}" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">` +
       `<foreignObject x="0" y="0" width="100%" height="100%">${xml}</foreignObject></svg>`;
@@ -933,6 +1060,7 @@
       failed: [...failed].map(([url, kind]) => ({ url, kind })),
       missingFonts: ctx ? [...ctx.missingFonts] : [],
       taintedCanvases: ctx ? ctx.taintedCanvases : 0,
+      moved: ctx ? ctx.moved : 0,   // сколько элементов копии поправила сверка раскладки
     };
     if (engine === 'html2canvas' && canvas.h2cFailed) {
       canvas.h2cFailed.forEach((url) => report.failed.push({ url, kind: 'image' }));
@@ -1212,38 +1340,21 @@
   // Раскладывает копию в скрытом iframe и ищет элементы, которые съехали относительно оригинала.
   // Выводит «первопричины» — элементы, у которых родитель на месте, а сами они сдвинуты.
   async function diagnose(userOpts = {}) {
+    // Показывает расхождения ДО сверки (lockLayout) — то, что она исправляет при снимке
     const opts = Object.assign({}, DEFAULTS, userOpts, { embedFonts: false });
     const { root, ctx, width, height, isDoc, target } = await buildClone(opts, true);
-
-    const frame = document.createElement('iframe');
-    frame.setAttribute('data-html-shot-ignore', '');
-    frame.style.cssText = `position:fixed;left:0;top:0;width:${width}px;height:${height}px;border:0;` +
-      'visibility:hidden;pointer-events:none;z-index:-2147483647';
-    document.body.appendChild(frame);
+    const expected = expectedPositions(ctx.pairs, opts, isDoc, target);
+    let frame = null;
     try {
-      const fdoc = frame.contentDocument;
-      try { fdoc.open(); fdoc.write('<!DOCTYPE html><html><head></head><body></body></html>'); fdoc.close(); } catch (_) {}
-      fdoc.body.style.margin = '0';
-      fdoc.body.appendChild(fdoc.adoptNode(root));
-      await new Promise((r) => requestAnimationFrame(() => r()));
-
-      const tRect = !isDoc ? target.getBoundingClientRect() : null;
-      const origPos = (pair) => {
-        const r = pair.node.getBoundingClientRect();
-        let x = r.left, y = r.top;
-        if (tRect) { x -= tRect.left; y -= tRect.top; }
-        else if (opts.fullPage && !pair.inFixed) { x += global.scrollX; y += global.scrollY; }
-        return { x, y, w: r.width, h: r.height };
-      };
-
+      ({ frame } = await layoutInFrame(root, width, height, opts));
       const bad = new Array(ctx.pairs.length).fill(false);
       const causes = [];
       ctx.pairs.forEach((pair, i) => {
         if (pair.parent < 0) return; // корень: у копии намеренно другая высота
         if (!pair.node.isConnected || !pair.el.getBoundingClientRect) return;
-        const o = origPos(pair);
+        const o = expected[i];
         const c = pair.el.getBoundingClientRect();
-        if (!o.w && !o.h) return;
+        if (!o) return;
         const dx = c.left - o.x, dy = c.top - o.y, dw = c.width - o.w, dh = c.height - o.h;
         bad[i] = Math.abs(dx) > 2 || Math.abs(dw) > 2 || Math.abs(dy) > 2 || Math.abs(dh) > 2;
         if (bad[i] && (pair.parent < 0 || !bad[pair.parent])) {
@@ -1271,18 +1382,18 @@
       }
       return causes;
     } finally {
-      frame.remove();
+      if (frame) frame.remove();
       cleanupSandbox();
     }
   }
 
-  const api = { version: 6, capture, toBlob, toDataURL: toDataURLApi, download, captureTab, diagnose, defaults: DEFAULTS, lastReport: null };
+  const api = { version: 7, capture, toBlob, toDataURL: toDataURLApi, download, captureTab, diagnose, defaults: DEFAULTS, lastReport: null };
   global.htmlShot = api;
 
   // Автозапуск (если вставили в консоль или подключили без data-manual)
   if (!(currentScript && currentScript.hasAttribute('data-manual'))) {
     const run = () => {
-      console.log('[htmlShot] v6: делаю скриншот…');
+      console.log('[htmlShot] v7: делаю скриншот…');
       console.time('[htmlShot]');
       // Настройки без правки файла: window.HTML_SHOT_CONFIG = { fullPage: false, method: 'tab' }
       api.download(global.HTML_SHOT_CONFIG || {})
